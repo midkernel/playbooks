@@ -17,3 +17,11 @@ The Midkernel Scan MCP/plugin lists playbooks from this public registry via `lis
 ## security-review
 
 This is the default Midkernel Scan playbook. Single skill, one-shot — not a multi-step agentflow graph. Surface: `scan`.
+
+## solana-validator-security
+
+Focused Scan playbook for Agave / jito-solana-class validator clients (banking stage, runtime, SVM, accounts DB, net, consensus, Jito/BAM overlay if present). Single skill, one-shot. Surface: `scan`.
+
+## firedancer-fuzz-triage
+
+FireBAM / Firedancer-class sanitizer and fuzz-crash triage (repro, minimize, invalid-input vs real bug, patch-oriented). Single skill, one-shot. Surface: `scan`.
