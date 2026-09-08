@@ -87,3 +87,34 @@ def test_local_in_task_override() -> None:
     review = next(node for node in spec["nodes"] if node["id"] == "review")
     assert review["target"]["kind"] == "local"
     assert review["target"]["cwd"].endswith("/repo")
+
+
+@pytest.mark.parametrize(
+    ("slug", "repo", "ref"),
+    [
+        (
+            "solana-validator-security",
+            "midkernel/bounty-target-jito-solana",
+            "master",
+        ),
+        (
+            "firedancer-fuzz-triage",
+            "midkernel/bounty-target-jito-firebam",
+            "main",
+        ),
+    ],
+)
+def test_bounty_playbooks_pin_private_default_targets(
+    slug: str, repo: str, ref: str
+) -> None:
+    spec = _load(slug)
+    nodes = {node["id"]: node for node in spec["nodes"]}
+    prepare = nodes["prepare"]["prompt"]
+    prompt = nodes["review"]["prompt"]
+    owner, name = repo.split("/", 1)
+    assert f"GITHUB_NAME=\"${{GITHUB_NAME:-{name}}}\"" in prepare
+    assert f"GITHUB_REF=\"${{GITHUB_REF:-{ref}}}\"" in prepare
+    assert repo in prompt
+    assert f"`{ref}`" in prompt
+    assert spec["description"]
+    assert name in spec["description"]

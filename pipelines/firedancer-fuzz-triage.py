@@ -14,7 +14,8 @@ emit(
     "firedancer-fuzz-triage",
     description=(
         "Patch-oriented sanitizer and fuzz-crash triage for FireBAM / Firedancer-class "
-        "C/C++ clients as a Kimi + OpenRouter agentflow graph. Same Midkernel-dev ECS "
-        "target and report.md artifact contract as security-review."
+        "C/C++ clients as a Kimi + OpenRouter agentflow graph. Default clone "
+        "midkernel/bounty-target-jito-firebam@main (shallow, no agave/ submodule). "
+        "Same Midkernel-dev ECS target and report.md artifact contract as security-review."
     ),
 )

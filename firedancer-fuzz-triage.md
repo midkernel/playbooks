@@ -1,12 +1,14 @@
 ---
 name: FireBAM/Firedancer-class fuzz triage
 slug: firedancer-fuzz-triage
-description: Patch-oriented sanitizer and fuzz-crash triage for FireBAM / Firedancer-class C/C++ clients. Native agentflow graph (Kimi CLI via OpenRouter).
+description: Patch-oriented sanitizer and fuzz-crash triage for FireBAM / Firedancer-class C/C++ clients. Native agentflow graph (Kimi CLI via OpenRouter). Default private target midkernel/bounty-target-jito-firebam@main.
 surface: scan
 kind: agentflow-graph
 pipeline: pipelines/firedancer-fuzz-triage.py
 harness: kimi
 provider: openrouter
+target_repo: midkernel/bounty-target-jito-firebam
+target_ref: main
 ---
 
 Triage sanitizer crashes and fuzz failures in this FireBAM / Firedancer-class C/C++ validator client into patch-ready bugs versus invalid-input or harness noise. Goal: a minimized repro, a root-cause note, and a concrete fix shape — not a generic security survey and not a bounty write-up.

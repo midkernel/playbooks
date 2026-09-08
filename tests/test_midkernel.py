@@ -60,3 +60,52 @@ def test_target_mode_local(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MIDKERNEL_AGENTFLOW_TARGET", "local")
     target = mk.node_target(cwd="/workspace/repo")
     assert target == {"kind": "local", "cwd": "/workspace/repo"}
+
+
+def test_default_targets_are_private_hunt_mirrors() -> None:
+    solana = mk.default_target("solana-validator-security")
+    firedancer = mk.default_target("firedancer-fuzz-triage")
+    assert solana is not None
+    assert solana.repo == "midkernel/bounty-target-jito-solana"
+    assert solana.ref == "master"
+    assert firedancer is not None
+    assert firedancer.repo == "midkernel/bounty-target-jito-firebam"
+    assert firedancer.ref == "main"
+    assert mk.default_target("security-review") is None
+
+
+def test_prepare_script_bakes_playbook_defaults() -> None:
+    security = mk.prepare_script("security-review")
+    assert "PLAYBOOK_SLUG:-security-review" in security
+    assert "bounty-target-jito-solana" not in security
+    assert "bounty-target-jito-firebam" not in security
+    assert ": \"${GITHUB_OWNER:?GITHUB_OWNER is required" in security
+    assert "--no-recurse-submodules" in security
+
+    solana = mk.prepare_script("solana-validator-security")
+    assert "PLAYBOOK_SLUG:-solana-validator-security" in solana
+    assert 'GITHUB_OWNER="${GITHUB_OWNER:-midkernel}"' in solana
+    assert 'GITHUB_NAME="${GITHUB_NAME:-bounty-target-jito-solana}"' in solana
+    assert 'GITHUB_REF="${GITHUB_REF:-master}"' in solana
+
+    firedancer = mk.prepare_script("firedancer-fuzz-triage")
+    assert "PLAYBOOK_SLUG:-firedancer-fuzz-triage" in firedancer
+    assert 'GITHUB_NAME="${GITHUB_NAME:-bounty-target-jito-firebam}"' in firedancer
+    assert 'GITHUB_REF="${GITHUB_REF:-main}"' in firedancer
+
+
+def test_review_prompt_names_default_targets() -> None:
+    security = mk.review_prompt("security-review")
+    assert "no default target" in security
+    assert "bounty-target-jito-solana" not in security
+
+    solana = mk.review_prompt("solana-validator-security")
+    assert "midkernel/bounty-target-jito-solana" in solana
+    assert "`master`" in solana
+    assert "Banking stage" in solana
+
+    firedancer = mk.review_prompt("firedancer-fuzz-triage")
+    assert "midkernel/bounty-target-jito-firebam" in firedancer
+    assert "`main`" in firedancer
+    assert "sanitizer" in firedancer.lower()
+    assert "agave/" in firedancer

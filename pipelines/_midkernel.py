@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,34 @@ REPORT_NAME = "report.md"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_OPENROUTER_MODEL = "moonshotai/kimi-k3"
 DEFAULT_PLAYBOOKS_REPO = "https://github.com/midkernel/playbooks"
+
+
+@dataclass(frozen=True)
+class DefaultTarget:
+    """Playbook default clone when GITHUB_OWNER / GITHUB_NAME / GITHUB_REF are unset."""
+
+    owner: str
+    name: str
+    ref: str
+
+    @property
+    def repo(self) -> str:
+        return f"{self.owner}/{self.name}"
+
+
+# Hunt-only private mirrors. security-review has no default — caller supplies owner/name.
+DEFAULT_TARGETS: dict[str, DefaultTarget] = {
+    "solana-validator-security": DefaultTarget(
+        owner="midkernel",
+        name="bounty-target-jito-solana",
+        ref="master",
+    ),
+    "firedancer-fuzz-triage": DefaultTarget(
+        owner="midkernel",
+        name="bounty-target-jito-firebam",
+        ref="main",
+    ),
+}
 
 # App container env (midkernel/app src/lib/agentflow-contract.ts).
 AGENT_ENV_APP = (
@@ -215,41 +244,60 @@ def kimi_openrouter_config(model: str | None = None) -> str:
     )
 
 
+def default_target(slug: str) -> DefaultTarget | None:
+    return DEFAULT_TARGETS.get(slug)
+
+
 def review_prompt(slug: str) -> str:
     skill = playbook_prompt(slug)
     dest = artifact_uri()
+    target = default_target(slug)
+    if target:
+        clone_line = (
+            f"- Default clone for this playbook is the private hunt mirror "
+            f"github.com/{target.repo} at ref `{target.ref}` "
+            f"(overridable via GITHUB_OWNER, GITHUB_NAME, GITHUB_REF). "
+            f"If the tree is not already at {repo_dir()}, clone it with GITHUB_TOKEN "
+            "(https://x-access-token:<token>@github.com/<owner>/<name>.git). "
+            "Shallow clone only — do not recurse submodules "
+            "(Firedancer `agave/` is out of scope unless the crash stack lands there)."
+        )
+    else:
+        clone_line = (
+            f"- Clone of github.com/${{GITHUB_OWNER}}/${{GITHUB_NAME}} if already present "
+            f"at {repo_dir()}, otherwise clone it with GITHUB_TOKEN "
+            "(https://x-access-token:<token>@github.com/<owner>/<name>.git), "
+            "optional GITHUB_REF as --branch. This playbook has no default target."
+        )
     return (
         f"{skill}\n\n"
         "You are Midkernel Scan running as the Kimi CLI harness on OpenRouter only "
-        "(not Bedrock, not AI Gateway, not OpenCode).\n\n"
+        "(not Bedrock, not AI Gateway). OpenCode is not part of this path.\n\n"
         "Workspace:\n"
-        f"- Clone of github.com/${{GITHUB_OWNER}}/${{GITHUB_NAME}} if already present "
-        f"at {repo_dir()}, otherwise clone it with GITHUB_TOKEN "
-        "(https://x-access-token:<token>@github.com/<owner>/<name>.git), "
-        "optional GITHUB_REF as --branch.\n"
+        f"{clone_line}\n"
         f"- Read RUN_ID, PLAYBOOK/PLAYBOOK_SLUG, PROFILE/SCAN_PROFILE, "
         "THREAT/THREAT_PIN from the environment. If THREAT is non-empty, "
-        "prioritize that pin; it is not a fourth profile.\n\n"
-        "Write a real security review to "
+        "prioritize that pin; it is not a fourth profile.\n"
+        "- Hunt only: no bounty-submit, disclosure-program, or Immunefi filing language.\n\n"
+        "Write the real review or triage to "
         f"**{REPORT_NAME}** in the workspace root of the cloned repo "
         f"(also copy it to {outputs_dir()}/{REPORT_NAME} if that directory exists).\n\n"
         "The Midkernel control plane uploads that file to "
         f"`{dest}` (s3://$ARTIFACTS_BUCKET/$ARTIFACTS_PREFIX$RUN_ID/{REPORT_NAME}).\n\n"
         "Report requirements:\n"
-        "- Ranked findings with severity, file paths, preconditions, impact, residual risk.\n"
-        "- A short covered-and-clean list for areas you inspected.\n"
-        "- No bounty-submit, disclosure-program, or Immunefi filing language.\n"
+        "- Follow the playbook skill body above for output shape.\n"
         "- No stub, placeholder, lorem ipsum, or \"report coming soon\" text. "
-        "If the tree is clean, say so with evidence of what you read.\n"
+        "If the tree is clean or every crash is harness/invalid-input, say so "
+        "with evidence of what you read.\n"
     )
 
 
-PREPARE_SCRIPT = r"""
+PREPARE_SCRIPT_TEMPLATE = r"""
 set -euo pipefail
 WORKDIR="${WORKDIR:-/workspace}"
 OUTPUTS_DIR="${OUTPUTS_DIR:-/outputs}"
 REPO_DIR="${WORKDIR}/repo"
-PLAYBOOK="${PLAYBOOK:-${PLAYBOOK_SLUG:-security-review}}"
+PLAYBOOK="${PLAYBOOK:-${PLAYBOOK_SLUG:-__PLAYBOOK_SLUG__}}"
 PROFILE="${PROFILE:-${SCAN_PROFILE:-balanced}}"
 THREAT="${THREAT:-${THREAT_PIN:-}}"
 ARTIFACTS_BUCKET="${ARTIFACTS_BUCKET:-midkernel-dev-artifacts}"
@@ -258,10 +306,10 @@ OPENROUTER_MODEL="${OPENROUTER_MODEL:-${MODEL:-moonshotai/kimi-k3}}"
 OPENROUTER_SECRET_ID="${OPENROUTER_SECRET_ID:-midkernel/dev/harness/openrouter-api-key}"
 GITHUB_TOKEN_SECRET_ID="${GITHUB_TOKEN_SECRET_ID:-midkernel/dev/harness/github-token}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
-
+__DEFAULT_CLONE__
 : "${RUN_ID:?RUN_ID is required}"
-: "${GITHUB_OWNER:?GITHUB_OWNER is required}"
-: "${GITHUB_NAME:?GITHUB_NAME is required}"
+: "${GITHUB_OWNER:?GITHUB_OWNER is required (no default target for this playbook)}"
+: "${GITHUB_NAME:?GITHUB_NAME is required (no default target for this playbook)}"
 
 case "$OPENROUTER_MODEL" in
   openrouter/*) OPENROUTER_MODEL="${OPENROUTER_MODEL#openrouter/}" ;;
@@ -354,14 +402,35 @@ if [ ! -d "$REPO_DIR/.git" ]; then
   CLONE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_OWNER}/${GITHUB_NAME}.git"
   rm -rf "$REPO_DIR"
   if [ -n "${GITHUB_REF:-}" ]; then
-    git clone --depth 1 --branch "$GITHUB_REF" "$CLONE_URL" "$REPO_DIR"
+    git clone --depth 1 --no-recurse-submodules --branch "$GITHUB_REF" "$CLONE_URL" "$REPO_DIR"
   else
-    git clone --depth 1 "$CLONE_URL" "$REPO_DIR"
+    git clone --depth 1 --no-recurse-submodules "$CLONE_URL" "$REPO_DIR"
   fi
 fi
 
 echo "prepared playbook=${PLAYBOOK} profile=${PROFILE} threat=${THREAT} repo=${GITHUB_OWNER}/${GITHUB_NAME} dest=s3://${ARTIFACTS_BUCKET}/${ARTIFACTS_PREFIX}${RUN_ID}/report.md"
 """
+
+
+def prepare_script(slug: str) -> str:
+    """Bake this graph's slug and optional default clone target into prepare."""
+    target = default_target(slug)
+    if target:
+        default_clone = "\n".join(
+            [
+                f'GITHUB_OWNER="${{GITHUB_OWNER:-{target.owner}}}"',
+                f'GITHUB_NAME="${{GITHUB_NAME:-{target.name}}}"',
+                f'GITHUB_REF="${{GITHUB_REF:-{target.ref}}}"',
+                "",
+            ]
+        )
+    else:
+        default_clone = ""
+    return (
+        PREPARE_SCRIPT_TEMPLATE.replace("__PLAYBOOK_SLUG__", slug)
+        .replace("__DEFAULT_CLONE__", default_clone)
+        .strip()
+    )
 
 
 def build_scan_graph(slug: str, *, description: str):
@@ -383,7 +452,7 @@ def build_scan_graph(slug: str, *, description: str):
     ) as graph:
         prepare = shell(
             task_id="prepare",
-            script=PREPARE_SCRIPT.strip(),
+            script=prepare_script(slug),
             timeout_seconds=10 * 60,
             target=node_target(),
         )

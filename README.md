@@ -2,7 +2,7 @@
 
 MIT-licensed public playbooks: Midkernel default runs and third-party agent units users can customize.
 
-Execution is **native [agentenv/agentflow](https://github.com/agentenv/agentflow)** (Python Graph API). OpenCode one-shot is **deferred** — there is no OpenCode adapter in agentflow; Midkernel uses the **Kimi CLI harness via OpenRouter** (not Bedrock, not AI Gateway).
+Execution is **native [agentenv/agentflow](https://github.com/agentenv/agentflow)** (Python Graph API) with the **Kimi CLI harness via OpenRouter** (not Bedrock, not AI Gateway). OpenCode is **not required** — it was only an example. Do not build or block on an OpenCode adapter. The hard lock is **OpenRouter** for models.
 
 Private Midkernel-only skills live in the private `skills` repo.
 
@@ -25,6 +25,7 @@ YAML frontmatter on each `<slug>.md`:
 | `pipeline` | Path the app/runner must start: `pipelines/<slug>.py` |
 | `harness` | `kimi` |
 | `provider` | `openrouter` |
+| `target_repo`, `target_ref` | Optional default clone (`owner/name` + git ref) when `GITHUB_OWNER` / `GITHUB_NAME` / `GITHUB_REF` are unset |
 
 The markdown **body** (after frontmatter) is the skill prompt. The graph loads it at build time. App `list_playbooks` / `GET /api/playbooks` should keep pointing at `<slug>.md` on `main`. Do not change the default slug `security-review` or path `security-review.md`.
 
@@ -76,8 +77,8 @@ Coordinate names with `midkernel/app` (`src/lib/agentflow-contract.ts`) and `mid
 | App (`AGENT_ENV`) | Runner alias | Required | Notes |
 | --- | --- | --- | --- |
 | `RUN_ID` | `RUN_ID` | yes | Artifact key segment. `[A-Za-z0-9._:-]{1,128}` |
-| `GITHUB_OWNER` | same | yes | Target repo owner |
-| `GITHUB_NAME` | same | yes | Target repo name |
+| `GITHUB_OWNER` | same | playbook | Target owner. Required unless the playbook sets `target_repo` |
+| `GITHUB_NAME` | same | playbook | Target name. Required unless the playbook sets `target_repo` |
 | `PLAYBOOK` | `PLAYBOOK_SLUG` | no | Default `security-review` |
 | `PROFILE` | `SCAN_PROFILE` | no | `low` \| `balanced` \| `max` |
 | `THREAT` | `THREAT_PIN` | no | Optional pin, max 80 chars. Not a fourth profile |
@@ -85,7 +86,7 @@ Coordinate names with `midkernel/app` (`src/lib/agentflow-contract.ts`) and `mid
 | `ARTIFACTS_PREFIX` | same | no | Default `runs/` |
 | `ARTIFACTS_KEY` | same | no | Default `runs/<RUN_ID>/report.md` |
 | `MODEL` / `OPENROUTER_MODEL` | `OPENROUTER_MODEL` | no | OpenRouter slug, default `moonshotai/kimi-k3` (optional `openrouter/` prefix) |
-| `GITHUB_REF` | same | no | Shallow clone `--branch` |
+| `GITHUB_REF` | same | no | Shallow clone `--branch`. Playbooks with `target_ref` default that ref |
 | `GITHUB_TOKEN` | same | yes* | Installation token; else SM `midkernel/dev/harness/github-token` |
 | `OPENROUTER_API_KEY` | same | yes* | Else SM `midkernel/dev/harness/openrouter-api-key` |
 | `MIDKERNEL_AGENTFLOW_TARGET` | same | no | `ecs` (default published graph) or `local` (in-task) |
@@ -107,25 +108,31 @@ Harness secrets are never in git. Image/task role may `GetSecretValue` on the tw
 
 ### security-review
 
-Default Midkernel Scan graph. `pipelines/security-review.py`. Surface: `scan`.
+Default Midkernel Scan graph. `pipelines/security-review.py`. Surface: `scan`. Caller must supply `GITHUB_OWNER` / `GITHUB_NAME`.
 
 ### solana-validator-security
 
 Same graph shape; skill body is the Agave / jito-solana-class review. `pipelines/solana-validator-security.py`.
 
+Default private hunt mirror: `midkernel/bounty-target-jito-solana` @ `master` (overridable). Hunt only — no Immunefi submit.
+
 ### firedancer-fuzz-triage
 
 Same graph shape; skill body is FireBAM / Firedancer-class fuzz triage. `pipelines/firedancer-fuzz-triage.py`.
+
+Default private hunt mirror: `midkernel/bounty-target-jito-firebam` @ `main` (overridable). Shallow clone, `--no-recurse-submodules` (Frankendancer `agave/` stays out unless the crash stack lands there). Hunt only — no Immunefi submit.
 
 ## Validate locally
 
 ```bash
 python3 -m pip install "agentflow @ git+https://github.com/agentenv/agentflow.git@09df0175ff2c88528c99b9f2c22f25b5e7622a8e"
 python3 pipelines/security-review.py | python3 -m json.tool
+python3 pipelines/solana-validator-security.py | python3 -m json.tool
+python3 pipelines/firedancer-fuzz-triage.py | python3 -m json.tool
 MIDKERNEL_AGENTFLOW_TARGET=local python3 pipelines/security-review.py | python3 -m json.tool
 python3 -m pytest -q
 ```
 
-`agentflow validate pipelines/security-review.py` if the CLI is on `PATH`. Do not run a live graph without a real OpenRouter key and a target repo — CI only validates schema.
+`agentflow validate pipelines/<slug>.py` if the CLI is on `PATH`. Do not run a live graph without a real OpenRouter key and a target repo — CI only validates schema.
 
 MIT.

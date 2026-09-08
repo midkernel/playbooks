@@ -24,6 +24,14 @@ def test_root_markdown_playbooks_exist() -> None:
         assert f"pipeline: pipelines/{slug}.py" in text
         assert "harness: kimi" in text
         assert "provider: openrouter" in text
+        if slug == "solana-validator-security":
+            assert "target_repo: midkernel/bounty-target-jito-solana" in text
+            assert "target_ref: master" in text
+        elif slug == "firedancer-fuzz-triage":
+            assert "target_repo: midkernel/bounty-target-jito-firebam" in text
+            assert "target_ref: main" in text
+        else:
+            assert "target_repo:" not in text
         body = text.split("---", 2)[-1].strip()
         assert body, f"{slug}.md body must remain a skill prompt"
 
@@ -34,10 +42,14 @@ def test_pipeline_files_exist() -> None:
         assert path.is_file(), f"missing graph {path}"
 
 
-def test_readme_documents_opencode_deferred() -> None:
+def test_readme_documents_openrouter_lock_and_default_targets() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "OpenRouter" in readme
+    assert "Kimi" in readme
+    assert "not required" in readme.lower()
     assert "OpenCode" in readme
-    assert "deferred" in readme.lower()
     assert "list_playbooks" in readme
     assert "MIDKERNEL_AGENTFLOW_TARGET" in readme
     assert "s3://midkernel-dev-artifacts/runs/" in readme
+    assert "midkernel/bounty-target-jito-solana" in readme
+    assert "midkernel/bounty-target-jito-firebam" in readme

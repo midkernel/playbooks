@@ -14,7 +14,8 @@ emit(
     "solana-validator-security",
     description=(
         "Outcome-first validator-client security review (Agave / jito-solana-class) "
-        "as a Kimi + OpenRouter agentflow graph. Same Midkernel-dev ECS target and "
-        "report.md artifact contract as security-review."
+        "as a Kimi + OpenRouter agentflow graph. Default clone "
+        "midkernel/bounty-target-jito-solana@master. Same Midkernel-dev ECS target "
+        "and report.md artifact contract as security-review."
     ),
 )

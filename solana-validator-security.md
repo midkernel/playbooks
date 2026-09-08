@@ -1,12 +1,14 @@
 ---
 name: solana-validator-security
 slug: solana-validator-security
-description: Outcome-first Scan playbook for Agave / jito-solana-class validator clients. Native agentflow graph (Kimi CLI via OpenRouter).
+description: Outcome-first Scan playbook for Agave / jito-solana-class validator clients. Native agentflow graph (Kimi CLI via OpenRouter). Default private target midkernel/bounty-target-jito-solana@master.
 surface: scan
 kind: agentflow-graph
 pipeline: pipelines/solana-validator-security.py
 harness: kimi
 provider: openrouter
+target_repo: midkernel/bounty-target-jito-solana
+target_ref: master
 ---
 
 Review this Agave / jito-solana-class validator client for security defects that can take a node down, corrupt ledger or account state, or let untrusted network or transaction input influence consensus, execution, or persisted state. Rust-first. Report concrete findings with file paths, preconditions, and impact on a running validator. Do not write a generic whole-repo survey.
