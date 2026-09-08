@@ -1,9 +1,12 @@
 ---
 name: solana-validator-security
 slug: solana-validator-security
-description: Outcome-first Scan playbook for Agave / jito-solana-class validator clients. Single skill, one-shot.
+description: Outcome-first Scan playbook for Agave / jito-solana-class validator clients. Native agentflow graph (Kimi CLI via OpenRouter).
 surface: scan
-kind: single-skill
+kind: agentflow-graph
+pipeline: pipelines/solana-validator-security.py
+harness: kimi
+provider: openrouter
 ---
 
 Review this Agave / jito-solana-class validator client for security defects that can take a node down, corrupt ledger or account state, or let untrusted network or transaction input influence consensus, execution, or persisted state. Rust-first. Report concrete findings with file paths, preconditions, and impact on a running validator. Do not write a generic whole-repo survey.
@@ -28,3 +31,5 @@ Skip unless a finding clearly reaches validator safety:
 Method: map the TPU/TVU and runtime entrypoints, then read the hot paths above. Prefer defects reachable from the network, untrusted transactions, snapshots, or gossip over local-only logic errors. If the tree is a Jito or BAM fork, diff mentally against stock Agave and spend extra time on the overlay.
 
 Output only: ranked findings (severity, location, trigger, impact, residual risk) and a short "looked, clean" list for the priority areas you covered. No bounty-submit, disclosure, or program-filing language.
+
+Write the review to `report.md`. Midkernel uploads it to `s3://midkernel-dev-artifacts/runs/<RUN_ID>/report.md`.

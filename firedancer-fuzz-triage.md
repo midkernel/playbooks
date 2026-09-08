@@ -1,9 +1,12 @@
 ---
 name: FireBAM/Firedancer-class fuzz triage
 slug: firedancer-fuzz-triage
-description: Patch-oriented sanitizer and fuzz-crash triage for FireBAM / Firedancer-class C/C++ clients. Single skill, one-shot.
+description: Patch-oriented sanitizer and fuzz-crash triage for FireBAM / Firedancer-class C/C++ clients. Native agentflow graph (Kimi CLI via OpenRouter).
 surface: scan
-kind: single-skill
+kind: agentflow-graph
+pipeline: pipelines/firedancer-fuzz-triage.py
+harness: kimi
+provider: openrouter
 ---
 
 Triage sanitizer crashes and fuzz failures in this FireBAM / Firedancer-class C/C++ validator client into patch-ready bugs versus invalid-input or harness noise. Goal: a minimized repro, a root-cause note, and a concrete fix shape — not a generic security survey and not a bounty write-up.
@@ -34,3 +37,5 @@ Patch-oriented output only:
 - Residual risk and any nearby sibling sites.
 
 If nothing reproduces or every crash is harness/invalid-input, say so in one short note and stop.
+
+Write the triage to `report.md`. Midkernel uploads it to `s3://midkernel-dev-artifacts/runs/<RUN_ID>/report.md`.
