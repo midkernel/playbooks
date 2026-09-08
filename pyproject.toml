@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "midkernel-playbooks"
+version = "0.1.0"
+description = "Public Midkernel Scan playbooks as agentflow graphs"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "agentflow @ git+https://github.com/agentenv/agentflow.git@09df0175ff2c88528c99b9f2c22f25b5e7622a8e",
+]
+
+[tool.setuptools.packages.find]
+include = ["pipelines*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
