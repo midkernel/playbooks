@@ -62,3 +62,7 @@ def test_readme_documents_openrouter_lock_and_default_targets() -> None:
     assert "GOAL_COUNT" in readme
     assert "THREAT" in readme
     assert "known-issues" in readme.lower() or "known-findings" in readme.lower()
+    assert "graph.json" in readme
+    assert "nodes/<nodeId>/prompt.md" in readme
+    assert "nodes/<nodeId>/output.md" in readme
+    assert "nodes/<nodeId>/meta.json" in readme

@@ -145,8 +145,30 @@ def test_build_scan_graph_unchanged_shape() -> None:
         "security-review",
         description="unchanged scan graph",
     )
-    ids = [node["id"] for node in graph.to_payload()["nodes"]]
+    payload = graph.to_payload()
+    ids = [node["id"] for node in payload["nodes"]]
     assert ids == ["prepare", "review", "publish"]
+    nodes = {node["id"]: node for node in payload["nodes"]}
+    assert nodes["review"]["executable"].endswith("node_io.py")
+    assert nodes["review"]["env"]["MIDKERNEL_NODE_ID"] == "review"
+    assert "python3" in nodes["prepare"]["prompt"]
+    assert "refusing to upload a stub" in nodes["publish"]["prompt"]
+    assert "stub report" in nodes["publish"]["prompt"]
+
+
+def test_goal_graph_hunters_follow_goal_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("agentflow")
+    monkeypatch.setenv("GOAL_COUNT", "3")
+    graph = mk.build_goal_scan_graph(
+        "goal-security-review",
+        description="dynamic hunters",
+    )
+    nodes = {node["id"]: node for node in graph.to_payload()["nodes"]}
+    assert "hunter-1" in nodes and "hunter-2" in nodes and "hunter-3" in nodes
+    assert "hunter-4" not in nodes
+    assert nodes["hunter-1"]["env"]["MIDKERNEL_NODE_DYNAMIC"] == "1"
+    assert nodes["hunter-1"]["env"]["MIDKERNEL_NODE_PARENT"] == "surface-split"
+    assert set(nodes["judge-a"]["depends_on"]) == {"hunter-1", "hunter-2", "hunter-3"}
 
 
 def test_review_prompt_names_default_targets() -> None:
