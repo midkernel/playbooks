@@ -23,3 +23,4 @@ jobs:
           agentflow validate pipelines/security-review.py
           agentflow validate pipelines/solana-validator-security.py
           agentflow validate pipelines/firedancer-fuzz-triage.py
+          agentflow validate pipelines/goal-security-review.py

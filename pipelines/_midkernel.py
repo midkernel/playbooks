@@ -36,6 +36,15 @@ REPORT_NAME = "report.md"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_OPENROUTER_MODEL = "moonshotai/kimi-k3"
 DEFAULT_PLAYBOOKS_REPO = "https://github.com/midkernel/playbooks"
+DEFAULT_GOAL_COUNT = 6
+MAX_GOAL_HUNTERS = 6
+DEFAULT_JUDGE_B_MODEL = "anthropic/claude-sonnet-4.5"
+DEFAULT_JUDGE_B_FALLBACK = "openai/gpt-4o"
+GOAL_HUNTER_IDS = tuple(f"hunter-{n}" for n in range(1, MAX_GOAL_HUNTERS + 1))
+THREAT_MODEL_NAME = "THREAT_MODEL.md"
+GOALS_MANIFEST = "goals/MANIFEST.md"
+VALIDATED_A_MANIFEST = "findings/validated-a/MANIFEST.md"
+VALIDATED_B_MANIFEST = "findings/validated-b/MANIFEST.md"
 
 
 @dataclass(frozen=True)
@@ -131,13 +140,46 @@ def scan_profile() -> str:
     return profile if profile in PROFILE_FARGATE else "balanced"
 
 
+def normalize_openrouter_model(raw: str, *, default: str = DEFAULT_OPENROUTER_MODEL) -> str:
+    slug = (raw or "").strip()
+    if slug.startswith("openrouter/"):
+        slug = slug[len("openrouter/") :]
+    if "/" not in slug:
+        return default
+    return slug
+
+
 def openrouter_model() -> str:
     raw = env_first("OPENROUTER_MODEL", "MODEL", default=DEFAULT_OPENROUTER_MODEL)
-    if raw.startswith("openrouter/"):
-        raw = raw[len("openrouter/") :]
-    if "/" not in raw:
-        return DEFAULT_OPENROUTER_MODEL
-    return raw
+    return normalize_openrouter_model(raw, default=DEFAULT_OPENROUTER_MODEL)
+
+
+def goal_count() -> int:
+    """Runtime/author hint. Graph hunters stay fixed at hunter-1..hunter-6."""
+    raw = env_first("GOAL_COUNT", default=str(DEFAULT_GOAL_COUNT))
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_GOAL_COUNT
+    return max(1, min(value, MAX_GOAL_HUNTERS))
+
+
+def judge_a_model() -> str:
+    raw = env_first("JUDGE_A_MODEL")
+    if raw:
+        return normalize_openrouter_model(raw, default=openrouter_model())
+    return openrouter_model()
+
+
+def judge_b_model() -> str:
+    """Different OpenRouter model than judge-a unless JUDGE_B_MODEL is set explicitly."""
+    raw = env_first("JUDGE_B_MODEL")
+    if raw:
+        return normalize_openrouter_model(raw, default=DEFAULT_JUDGE_B_MODEL)
+    candidate = DEFAULT_JUDGE_B_MODEL
+    if candidate == judge_a_model():
+        return DEFAULT_JUDGE_B_FALLBACK
+    return candidate
 
 
 def artifact_key(run_id: str | None = None) -> str:
@@ -487,6 +529,324 @@ def build_scan_graph(slug: str, *, description: str):
 
 def emit(slug: str, *, description: str) -> None:
     print(build_scan_graph(slug, description=description).to_json())
+
+
+def clone_instructions(slug: str) -> str:
+    """Same clone wording as ``review_prompt`` so goal nodes share the workspace contract."""
+    target = default_target(slug)
+    if target:
+        return (
+            f"- Default clone for this playbook is the private hunt mirror "
+            f"github.com/{target.repo} at ref `{target.ref}` "
+            f"(overridable via GITHUB_OWNER, GITHUB_NAME, GITHUB_REF). "
+            f"If the tree is not already at {repo_dir()}, clone it with GITHUB_TOKEN "
+            "(https://x-access-token:<token>@github.com/<owner>/<name>.git). "
+            "Shallow clone only — do not recurse submodules "
+            "(Firedancer `agave/` is out of scope unless the crash stack lands there)."
+        )
+    return (
+        f"- Clone of github.com/${{GITHUB_OWNER}}/${{GITHUB_NAME}} if already present "
+        f"at {repo_dir()}, otherwise clone it with GITHUB_TOKEN "
+        "(https://x-access-token:<token>@github.com/<owner>/<name>.git), "
+        "optional GITHUB_REF as --branch. This playbook has no default target."
+    )
+
+
+def goal_workspace_preamble(slug: str) -> str:
+    dest = artifact_uri()
+    return (
+        "You are Midkernel Scan running as the Kimi CLI harness on OpenRouter only "
+        "(not Bedrock, not AI Gateway). OpenCode is not part of this path.\n\n"
+        "Workspace:\n"
+        f"{clone_instructions(slug)}\n"
+        f"- Shared handoff is files under the cloned repo ({repo_dir()} when local). "
+        "Read and write THREAT_MODEL.md, goals/, findings/, and report.md there.\n"
+        f"- Read RUN_ID, PLAYBOOK/PLAYBOOK_SLUG, PROFILE/SCAN_PROFILE, "
+        "THREAT/THREAT_PIN, GOAL_COUNT from the environment.\n"
+        "- Hunt only: no bounty-submit, disclosure-program, or Immunefi filing language.\n"
+        "- Do not search local known-findings files or open GitHub issues/PRs for "
+        "duplicates. That dedupe step is out of scope for this playbook.\n"
+        f"- Final artifact is **{REPORT_NAME}**. The control plane uploads it to `{dest}`.\n"
+    )
+
+
+def _file_criteria(*paths: str) -> list[dict[str, str]]:
+    criteria: list[dict[str, str]] = []
+    for path in paths:
+        criteria.append({"kind": "file_exists", "path": path})
+        criteria.append({"kind": "file_nonempty", "path": path})
+    return criteria
+
+
+def _kimi_scan_node(
+    *,
+    task_id: str,
+    prompt: str,
+    model: str | None = None,
+    timeout_seconds: int | None = None,
+    success_criteria: list[dict[str, str]] | None = None,
+    cwd: str | None = None,
+):
+    from agentflow import kimi
+
+    slug = model or openrouter_model()
+    kwargs: dict[str, Any] = {
+        "task_id": task_id,
+        "prompt": prompt,
+        "model": slug,
+        "tools": "read_write",
+        "provider": openrouter_provider(),
+        "env": openrouter_node_env(),
+        "extra_args": ["--config", kimi_openrouter_config(slug)],
+        "timeout_seconds": timeout_seconds or PROFILE_TIMEOUT_SECONDS[scan_profile()],
+        "retries": 0,
+        "target": node_target(cwd=cwd),
+    }
+    if success_criteria:
+        kwargs["success_criteria"] = success_criteria
+    return kimi(**kwargs)
+
+
+def _goal_skill(slug: str) -> str:
+    try:
+        return playbook_prompt(slug)
+    except FileNotFoundError:
+        return ""
+
+
+def threat_model_prompt(slug: str) -> str:
+    skill = _goal_skill(slug)
+    skill_block = f"{skill}\n\n" if skill else ""
+    return (
+        f"{skill_block}"
+        f"{goal_workspace_preamble(slug)}\n"
+        "Outcome for this node: write **THREAT_MODEL.md** in the cloned-repo workspace.\n\n"
+        "THREAT_MODEL.md must define, precisely:\n"
+        "- The attacker (who they are, what they control, what they do not).\n"
+        "- Entry points and trust boundaries.\n"
+        "- What a valid security finding looks like.\n"
+        "- What does NOT count (local-only preconditions, operator error, "
+        "intended reject paths, out-of-scope components).\n\n"
+        "If THREAT / THREAT_PIN is non-empty, incorporate that pin as a priority "
+        "constraint. It is not a fourth profile and it does not replace the model.\n\n"
+        "Define the outcome space only. Do not prescribe how later hunters should "
+        "search, which tools to run, or which files to open first.\n"
+        "Do not write goals/, findings/, or report.md in this node.\n"
+    )
+
+
+def goal_author_prompt(slug: str) -> str:
+    return (
+        f"{goal_workspace_preamble(slug)}\n"
+        "Outcome for this node: from THREAT_MODEL.md, write N goal prompts under "
+        "**goals/** as markdown files.\n\n"
+        "Read GOAL_COUNT from the environment (default 6, maximum 6). The intended "
+        "split is 5 attack-surface goals plus 1 fully open roam unless GOAL_COUNT "
+        "is smaller.\n\n"
+        "Each goal file is one precise success condition — an outcome, not a path. "
+        "Spend tokens defining what done looks like and what does not count. Do not "
+        "tell the hunter how to get there.\n\n"
+        "Name files ``goals/01-*.md`` … ``goals/0N-*.md`` so hunter-k can pick "
+        "``goals/0k-*.md``. Put the open-roam goal last when N>=2.\n"
+        "Write **goals/MANIFEST.md** listing each file and its one-line outcome.\n\n"
+        "Before finalizing, self-red-team every goal for lazy outs a future model "
+        "might take (declare done after a directory listing, write a generic "
+        "checklist, treat “no bugs found yet” as success, survey instead of hunt). "
+        "Revise the criteria so those outs do not count.\n"
+        "Do not invent findings. Do not write report.md.\n"
+    )
+
+
+def surface_split_prompt(slug: str) -> str:
+    return (
+        f"{goal_workspace_preamble(slug)}\n"
+        "Outcome for this node: after reading the tree and THREAT_MODEL.md, assign "
+        "the top attack surfaces and the open roam into the goal files (rewrite "
+        "goals/ and goals/MANIFEST.md as needed).\n\n"
+        "One outcome per goal file. Keep filenames ``goals/01-*.md`` … so hunter-k "
+        "still maps to ``goals/0k-*.md``.\n"
+        "Write persistence into each goal: “no bugs found yet” is not done.\n"
+        "Do not add a known-issues or GitHub-issue/PR duplicate search step.\n"
+        "Do not invent findings. Do not write report.md.\n"
+    )
+
+
+def hunter_prompt(slug: str, index: int) -> str:
+    padded = f"{index:02d}"
+    task_id = f"hunter-{index}"
+    result = f"findings/{task_id}/RESULT.md"
+    return (
+        f"{goal_workspace_preamble(slug)}\n"
+        f"You are **{task_id}**. Pick the goal file matching ``goals/{padded}-*.md`` "
+        "if it exists.\n\n"
+        f"If no matching goal file is present, no-op cleanly: write **{result}** "
+        "stating that this hunter was unassigned (GOAL_COUNT smaller than this "
+        "slot, or the file is missing) and stop. That is success.\n\n"
+        "If the goal file exists, hunt that single outcome against THREAT_MODEL.md. "
+        "One outcome only — do not take on other hunters' surfaces.\n"
+        "Persistence: “no bugs found yet” is not done. Keep going until you have "
+        "a concrete candidate or you have exhausted the assigned surface and can "
+        "write evidence of what you actually read and tried.\n\n"
+        "Write candidates under "
+        f"**findings/{task_id}/** (one file per candidate, plus {result}). "
+        "RESULT.md must record candidates found or a clean miss with evidence.\n\n"
+        "Do not search local known-findings files or open GitHub issues/PRs for "
+        "duplicates. Do not invent. Do not write report.md.\n"
+    )
+
+
+def judge_a_prompt(slug: str) -> str:
+    return (
+        f"{goal_workspace_preamble(slug)}\n"
+        "Outcome for this node: security-relevance judge versus THREAT_MODEL.md.\n\n"
+        "Read every hunter RESULT.md and candidate under findings/hunter-*/. "
+        "Keep only candidates that pose a genuine security risk inside the threat "
+        "model. Drop impact-free nits, speculative style notes, and anything the "
+        "threat model says does not count.\n\n"
+        "Copy or rewrite survivors under **findings/validated-a/** "
+        "(one file per survivor) and write **findings/validated-a/MANIFEST.md** "
+        "listing keep/drop with a one-line reason. If nothing survives, the "
+        "manifest must say so and record what you reviewed.\n"
+        "Do not invent findings. Do not write report.md.\n"
+    )
+
+
+def judge_b_prompt(slug: str) -> str:
+    return (
+        f"{goal_workspace_preamble(slug)}\n"
+        "Outcome for this node: PoC / exploitability judge. You are a different "
+        "OpenRouter model than judge-a on purpose.\n\n"
+        "Read findings/validated-a/ only (do not restore judge-a drops). "
+        "A survivor must have a plausible attacker path and a minimal proof "
+        "sketch — or a concrete reason the primitive is exploitable — under "
+        "THREAT_MODEL.md.\n\n"
+        "Copy or rewrite survivors under **findings/validated-b/** and write "
+        "**findings/validated-b/MANIFEST.md** with keep/drop reasons. "
+        "If nothing survives, say so with evidence of what you checked.\n"
+        "Do not invent findings. Do not write report.md.\n"
+    )
+
+
+def assemble_prompt(slug: str) -> str:
+    skill = _goal_skill(slug)
+    skill_block = f"{skill}\n\n" if skill else ""
+    dest = artifact_uri()
+    return (
+        f"{skill_block}"
+        f"{goal_workspace_preamble(slug)}\n"
+        "Outcome for this node: write the real **report.md** from dual-pass "
+        "survivors only (findings/validated-b/).\n\n"
+        "Also copy report.md to "
+        f"{outputs_dir()}/{REPORT_NAME} if that directory exists.\n"
+        f"The control plane uploads it to `{dest}`.\n\n"
+        "Rules:\n"
+        "- Include only judge-b survivors. Never invent a finding.\n"
+        "- Empty findings are allowed if the report shows evidence of what was "
+        "tried (threat model, goals, hunters, both judges).\n"
+        "- No stub, placeholder, lorem ipsum, or “report coming soon” text.\n"
+        "- Follow the playbook skill body for output shape.\n"
+        "- Hunt only: no bounty-submit or disclosure-program language.\n"
+    )
+
+
+def build_goal_scan_graph(slug: str, *, description: str):
+    """prepare → threat-model → goal-author → surface-split → hunters → judges → assemble → publish.
+
+    Hunters are a fixed fan-out (hunter-1..hunter-6). Each picks goals/0N-*.md
+    if present and no-ops cleanly if missing. Known-issues / GitHub dedupe is
+    intentionally omitted.
+    """
+    from agentflow import Graph, shell
+
+    timeout = PROFILE_TIMEOUT_SECONDS[scan_profile()]
+    cwd = repo_dir() if agentflow_target_mode() == "local" else None
+    judge_a = judge_a_model()
+    judge_b = judge_b_model()
+
+    with Graph(
+        slug,
+        description=description,
+        working_dir=".",
+        concurrency=MAX_GOAL_HUNTERS,
+        fail_fast=True,
+    ) as graph:
+        prepare = shell(
+            task_id="prepare",
+            script=prepare_script(slug),
+            timeout_seconds=10 * 60,
+            target=node_target(),
+        )
+        threat = _kimi_scan_node(
+            task_id="threat-model",
+            prompt=threat_model_prompt(slug),
+            timeout_seconds=timeout,
+            success_criteria=_file_criteria(THREAT_MODEL_NAME),
+            cwd=cwd,
+        )
+        author = _kimi_scan_node(
+            task_id="goal-author",
+            prompt=goal_author_prompt(slug),
+            timeout_seconds=timeout,
+            success_criteria=_file_criteria(GOALS_MANIFEST),
+            cwd=cwd,
+        )
+        split = _kimi_scan_node(
+            task_id="surface-split",
+            prompt=surface_split_prompt(slug),
+            timeout_seconds=timeout,
+            success_criteria=_file_criteria(GOALS_MANIFEST),
+            cwd=cwd,
+        )
+        hunters = [
+            _kimi_scan_node(
+                task_id=f"hunter-{index}",
+                prompt=hunter_prompt(slug, index),
+                timeout_seconds=timeout,
+                success_criteria=_file_criteria(f"findings/hunter-{index}/RESULT.md"),
+                cwd=cwd,
+            )
+            for index in range(1, MAX_GOAL_HUNTERS + 1)
+        ]
+        relevance = _kimi_scan_node(
+            task_id="judge-a",
+            prompt=judge_a_prompt(slug),
+            model=judge_a,
+            timeout_seconds=timeout,
+            success_criteria=_file_criteria(VALIDATED_A_MANIFEST),
+            cwd=cwd,
+        )
+        exploit = _kimi_scan_node(
+            task_id="judge-b",
+            prompt=judge_b_prompt(slug),
+            model=judge_b,
+            timeout_seconds=timeout,
+            success_criteria=_file_criteria(VALIDATED_B_MANIFEST),
+            cwd=cwd,
+        )
+        assemble = _kimi_scan_node(
+            task_id="assemble",
+            prompt=assemble_prompt(slug),
+            timeout_seconds=timeout,
+            success_criteria=_file_criteria(REPORT_NAME),
+            cwd=cwd,
+        )
+        publish = shell(
+            task_id="publish",
+            script=PUBLISH_SCRIPT.strip(),
+            timeout_seconds=5 * 60,
+            target=node_target(cwd=cwd),
+            success_criteria=[
+                {"kind": "output_contains", "value": "uploaded s3://"},
+            ],
+        )
+        prepare >> threat >> author >> split
+        split >> hunters
+        hunters >> relevance >> exploit >> assemble >> publish
+    return graph
+
+
+def emit_goal(slug: str, *, description: str) -> None:
+    print(build_goal_scan_graph(slug, description=description).to_json())
 
 
 PUBLISH_SCRIPT = r"""

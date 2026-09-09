@@ -41,7 +41,7 @@ The markdown **body** (after frontmatter) is the skill prompt. The graph loads i
 
    `MIDKERNEL_AGENTFLOW_TARGET=local` keeps nodes **inside the already-launched task** (same filesystem, midkernel-dev task role, log group `/agentflow`). That avoids nested `RunTask` and stock agentflow creating IAM role `agentflow-ecs-execution` plus log group `/agentflow/<node.id>`.
 
-4. The graph: **prepare** (secrets + clone + Kimi OpenRouter config) → **review** (`kimi()` / OpenRouter) → **publish** (`report.md` to S3). Missing, empty, or stub reports fail the node; nothing is uploaded.
+4. The graph then runs inside that task. Default playbooks (`security-review`, Solana, Firedancer) are **prepare** → **review** → **publish**. `goal-security-review` is **prepare** → **threat-model** → **goal-author** → **surface-split** → **hunter-1..hunter-6** → **judge-a** → **judge-b** → **assemble** → **publish**. Missing, empty, or stub `report.md` fails publish; nothing is uploaded.
 
 `externalAgentflowId` on the Run stays the Fargate task ARN. Observe completion the same way as today (`GET /api/runs/:id` + cron). Presign `s3://midkernel-dev-artifacts/runs/<RUN_ID>/report.md`.
 
@@ -81,7 +81,10 @@ Coordinate names with `midkernel/app` (`src/lib/agentflow-contract.ts`) and `mid
 | `GITHUB_NAME` | same | playbook | Target name. Required unless the playbook sets `target_repo` |
 | `PLAYBOOK` | `PLAYBOOK_SLUG` | no | Default `security-review` |
 | `PROFILE` | `SCAN_PROFILE` | no | `low` \| `balanced` \| `max` |
-| `THREAT` | `THREAT_PIN` | no | Optional pin, max 80 chars. Not a fourth profile |
+| `THREAT` | `THREAT_PIN` | no | Optional pin, max 80 chars. Not a fourth profile. `goal-security-review` folds it into `THREAT_MODEL.md` |
+| `GOAL_COUNT` | same | no | `goal-security-review` only. How many goal files to author. Default **6** (5 surfaces + 1 open roam). Max 6 (fixed `hunter-1`…`hunter-6`) |
+| `JUDGE_A_MODEL` | same | no | OpenRouter slug for the relevance judge. Default `OPENROUTER_MODEL` / `moonshotai/kimi-k3` |
+| `JUDGE_B_MODEL` | same | no | OpenRouter slug for the PoC/exploitability judge. Default `anthropic/claude-sonnet-4.5` (falls back to `openai/gpt-4o` if that would match judge-a) |
 | `ARTIFACTS_BUCKET` | same | no | Default `midkernel-dev-artifacts` |
 | `ARTIFACTS_PREFIX` | same | no | Default `runs/` |
 | `ARTIFACTS_KEY` | same | no | Default `runs/<RUN_ID>/report.md` |
@@ -122,6 +125,24 @@ Same graph shape; skill body is FireBAM / Firedancer-class fuzz triage. `pipelin
 
 Default private hunt mirror: `midkernel/bounty-target-jito-firebam` @ `main` (overridable). Shallow clone, `--no-recurse-submodules` (Frankendancer `agave/` stays out unless the crash stack lands there). Hunt only — no Immunefi submit.
 
+### goal-security-review
+
+Trail of Bits–style `/goal` hunt (outcome, not path). `pipelines/goal-security-review.py`. Same OpenRouter + Kimi lock, Midkernel-dev ECS target, and fail-closed `report.md` → `s3://midkernel-dev-artifacts/runs/<RUN_ID>/report.md` as `security-review`. Caller supplies `GITHUB_OWNER` / `GITHUB_NAME` (no default target).
+
+Graph (shared-workspace file handoff under the cloned repo):
+
+1. **prepare** — clone, OpenRouter/Kimi config, secrets (same `prepare_script` as the other Scan playbooks).
+2. **threat-model** — write `THREAT_MODEL.md` (attacker, entry points, trust boundaries, what does **not** count). Honors `THREAT` / `THREAT_PIN`. Does not prescribe how to hunt.
+3. **goal-author** — from the threat model, write N goal prompts under `goals/` (`01-*.md` …). Each file is one precise success condition. Self-red-teams lazy outs. `GOAL_COUNT` default **6** (5 surfaces + 1 open roam).
+4. **surface-split** — read the tree + threat model; assign surfaces / open roam into those goal files. Persistence: “no bugs found yet” is not done.
+5. **hunter-1** … **hunter-6** — fixed fan-out (agentflow does not spawn a dynamic N at runtime). Each picks `goals/0N-*.md` if present and no-ops cleanly if missing. Candidates go under `findings/hunter-N/`. **No** known-issues / GitHub issue-or-PR duplicate search.
+6. **judge-a** — security-relevance vs `THREAT_MODEL.md` (default Kimi / `OPENROUTER_MODEL`). Survivors → `findings/validated-a/`.
+7. **judge-b** — PoC / exploitability on a **different** OpenRouter model (default `anthropic/claude-sonnet-4.5`). Survivors → `findings/validated-b/`.
+8. **assemble** — only dual-pass survivors → `report.md`. Empty findings with evidence of what was tried is allowed. Never invent. No stub language.
+9. **publish** — same `PUBLISH_SCRIPT` (nonempty, non-stub `report.md` or fail closed).
+
+Out of scope: known-issues / issue-tracker dedupe, CVE / P-critical variant orchestration, aicov-style coverage tooling.
+
 ## Validate locally
 
 ```bash
@@ -129,6 +150,7 @@ python3 -m pip install "agentflow @ git+https://github.com/agentenv/agentflow.gi
 python3 pipelines/security-review.py | python3 -m json.tool
 python3 pipelines/solana-validator-security.py | python3 -m json.tool
 python3 pipelines/firedancer-fuzz-triage.py | python3 -m json.tool
+python3 pipelines/goal-security-review.py | python3 -m json.tool
 MIDKERNEL_AGENTFLOW_TARGET=local python3 pipelines/security-review.py | python3 -m json.tool
 python3 -m pytest -q
 ```

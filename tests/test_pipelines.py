@@ -19,6 +19,24 @@ EXPECTED = (
     "firedancer-fuzz-triage",
 )
 
+GOAL_SLUG = "goal-security-review"
+GOAL_NODES = (
+    "prepare",
+    "threat-model",
+    "goal-author",
+    "surface-split",
+    "hunter-1",
+    "hunter-2",
+    "hunter-3",
+    "hunter-4",
+    "hunter-5",
+    "hunter-6",
+    "judge-a",
+    "judge-b",
+    "assemble",
+    "publish",
+)
+
 pytest.importorskip("agentflow")
 
 
@@ -118,3 +136,87 @@ def test_bounty_playbooks_pin_private_default_targets(
     assert f"`{ref}`" in prompt
     assert spec["description"]
     assert name in spec["description"]
+
+
+def test_goal_security_review_graph_nodes_and_openrouter_lock() -> None:
+    spec = _load(GOAL_SLUG)
+    assert spec["name"] == GOAL_SLUG
+    nodes = {node["id"]: node for node in spec["nodes"]}
+    assert tuple(nodes) == GOAL_NODES or set(nodes) == set(GOAL_NODES)
+    assert set(nodes) == set(GOAL_NODES)
+
+    assert nodes["threat-model"]["depends_on"] == ["prepare"]
+    assert nodes["goal-author"]["depends_on"] == ["threat-model"]
+    assert nodes["surface-split"]["depends_on"] == ["goal-author"]
+    for index in range(1, 7):
+        hunter = nodes[f"hunter-{index}"]
+        assert hunter["depends_on"] == ["surface-split"]
+        assert hunter["agent"] == "kimi"
+        assert hunter["provider"]["name"] == "openrouter"
+        assert f"goals/{index:02d}-" in hunter["prompt"]
+        assert "no-op" in hunter["prompt"].lower()
+        assert "known-findings" in hunter["prompt"] or "known-issues" in hunter["prompt"]
+        assert any(
+            c.get("path") == f"findings/hunter-{index}/RESULT.md"
+            for c in hunter.get("success_criteria", [])
+        )
+
+    assert set(nodes["judge-a"]["depends_on"]) == {f"hunter-{i}" for i in range(1, 7)}
+    assert nodes["judge-b"]["depends_on"] == ["judge-a"]
+    assert nodes["assemble"]["depends_on"] == ["judge-b"]
+    assert nodes["publish"]["depends_on"] == ["assemble"]
+
+    for task_id in (
+        "threat-model",
+        "goal-author",
+        "surface-split",
+        "judge-a",
+        "judge-b",
+        "assemble",
+    ):
+        node = nodes[task_id]
+        assert node["agent"] == "kimi"
+        assert node["provider"]["name"] == "openrouter"
+        assert node["provider"]["base_url"] == "https://openrouter.ai/api/v1"
+        assert node["provider"]["api_key_env"] == "OPENROUTER_API_KEY"
+        assert node["tools"] == "read_write"
+        assert node["target"]["kind"] == "ecs"
+        assert node["target"]["cluster"] == "midkernel-dev"
+
+    assert nodes["judge-a"]["model"] == "moonshotai/kimi-k3"
+    assert nodes["judge-b"]["model"] != nodes["judge-a"]["model"]
+    assert nodes["judge-b"]["model"] == "anthropic/claude-sonnet-4.5"
+
+    assert "THREAT_MODEL.md" in nodes["threat-model"]["prompt"]
+    assert "GOAL_COUNT" in nodes["goal-author"]["prompt"]
+    assert "Do not prescribe" in nodes["threat-model"]["prompt"]
+    assert "validated-b" in nodes["assemble"]["prompt"]
+    assert "Never invent" in nodes["assemble"]["prompt"] or "never invent" in nodes["assemble"]["prompt"]
+    assert any(c.get("path") == "report.md" for c in nodes["assemble"].get("success_criteria", []))
+
+    prepare = nodes["prepare"]
+    publish = nodes["publish"]
+    assert prepare["agent"] == "shell"
+    assert publish["agent"] == "shell"
+    assert "refusing to upload a stub" in publish["prompt"]
+    assert "stub report" in publish["prompt"]
+
+
+def test_goal_security_review_local_in_task_override() -> None:
+    spec = _load(GOAL_SLUG, env={"MIDKERNEL_AGENTFLOW_TARGET": "local"})
+    assemble = next(node for node in spec["nodes"] if node["id"] == "assemble")
+    assert assemble["target"]["kind"] == "local"
+    assert assemble["target"]["cwd"].endswith("/repo")
+
+
+def test_goal_security_review_judge_models_follow_env() -> None:
+    spec = _load(
+        GOAL_SLUG,
+        env={
+            "JUDGE_A_MODEL": "openrouter/openai/gpt-4o",
+            "JUDGE_B_MODEL": "google/gemini-2.5-pro",
+        },
+    )
+    nodes = {node["id"]: node for node in spec["nodes"]}
+    assert nodes["judge-a"]["model"] == "openai/gpt-4o"
+    assert nodes["judge-b"]["model"] == "google/gemini-2.5-pro"

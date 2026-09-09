@@ -10,6 +10,7 @@ EXPECTED = (
     "security-review",
     "solana-validator-security",
     "firedancer-fuzz-triage",
+    "goal-security-review",
 )
 
 
@@ -34,6 +35,10 @@ def test_root_markdown_playbooks_exist() -> None:
             assert "target_repo:" not in text
         body = text.split("---", 2)[-1].strip()
         assert body, f"{slug}.md body must remain a skill prompt"
+        if slug == "goal-security-review":
+            assert "GOAL_COUNT" in body
+            assert "THREAT_MODEL.md" in body
+            assert "known-findings" in body or "known-issues" in body
 
 
 def test_pipeline_files_exist() -> None:
@@ -53,3 +58,7 @@ def test_readme_documents_openrouter_lock_and_default_targets() -> None:
     assert "s3://midkernel-dev-artifacts/runs/" in readme
     assert "midkernel/bounty-target-jito-solana" in readme
     assert "midkernel/bounty-target-jito-firebam" in readme
+    assert "goal-security-review" in readme
+    assert "GOAL_COUNT" in readme
+    assert "THREAT" in readme
+    assert "known-issues" in readme.lower() or "known-findings" in readme.lower()
