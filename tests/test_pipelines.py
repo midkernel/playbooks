@@ -73,6 +73,9 @@ def test_security_review_graph_is_kimi_openrouter_on_midkernel_ecs() -> None:
     assert review["executable"].endswith("node_io.py")
     assert Path(review["executable"]).name == "_node_io.py"
     assert Path(review["executable"]).is_file()
+    assert os.access(review["executable"], os.X_OK)
+    assert review["env"]["MIDKERNEL_KIMI_BIN"]
+    assert review["env"]["BASH_ENV"] == "/dev/null"
     assert review["env"]["MIDKERNEL_NODE_ID"] == "review"
     assert review["agent"] == "kimi"
     assert review["provider"]["name"] == "openrouter"
@@ -194,6 +197,9 @@ def test_goal_security_review_graph_nodes_and_openrouter_lock() -> None:
         assert hunter["env"]["MIDKERNEL_NODE_DYNAMIC"] == "1"
         assert hunter["env"]["MIDKERNEL_NODE_PARENT"] == "surface-split"
         assert hunter["executable"].endswith("node_io.py")
+        assert os.access(hunter["executable"], os.X_OK)
+        assert hunter["env"]["MIDKERNEL_KIMI_BIN"]
+        assert hunter["env"]["BASH_ENV"] == "/dev/null"
 
     assert nodes["judge-a"]["model"] == "moonshotai/kimi-k3"
     assert nodes["judge-b"]["model"] != nodes["judge-a"]["model"]

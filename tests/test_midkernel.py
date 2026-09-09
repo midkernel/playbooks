@@ -157,6 +157,9 @@ def test_build_scan_graph_unchanged_shape() -> None:
         Path(__file__).resolve().parents[1] / "pipelines" / "_node_io.py"
     ).resolve()
     assert nodes["review"]["env"]["MIDKERNEL_NODE_ID"] == "review"
+    assert nodes["review"]["env"]["MIDKERNEL_KIMI_BIN"]
+    assert nodes["prepare"]["env"]["BASH_ENV"] == "/dev/null"
+    assert nodes["publish"]["env"]["MIDKERNEL_NODE_READY"] == "1"
     assert "python3" in nodes["prepare"]["prompt"]
     assert "refusing to upload a stub" in nodes["publish"]["prompt"]
     assert "stub report" in nodes["publish"]["prompt"]

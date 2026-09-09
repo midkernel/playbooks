@@ -17,6 +17,7 @@ try:
         bootstrap_run_io,
         kimi_executable,
         kimi_io_env,
+        shell_io_env,
         wrap_shell_script,
     )
 except ImportError:  # ``python3 pipelines/<slug>.py`` puts this dir on sys.path
@@ -24,6 +25,7 @@ except ImportError:  # ``python3 pipelines/<slug>.py`` puts this dir on sys.path
         bootstrap_run_io,
         kimi_executable,
         kimi_io_env,
+        shell_io_env,
         wrap_shell_script,
     )
 
@@ -385,10 +387,13 @@ export WORKDIR
 export OUTPUTS_DIR
 mkdir -p "$WORKDIR" "$OUTPUTS_DIR" "$HOME/.kimi" "$WORKDIR/.midkernel"
 export MIDKERNEL_NODE_IO="${MIDKERNEL_NODE_IO:-1}"
+export BASH_ENV=/dev/null
+export MIDKERNEL_NODE_READY=1
 if [ -x /opt/midkernel/kimi.bin ]; then
   export MIDKERNEL_KIMI_BIN="${MIDKERNEL_KIMI_BIN:-/opt/midkernel/kimi.bin}"
+  export KIMI_REAL_BIN="${KIMI_REAL_BIN:-$MIDKERNEL_KIMI_BIN}"
 fi
-echo "node io: prepare WORKDIR=$WORKDIR RUN_ID=${RUN_ID:-unset} MIDKERNEL_NODE_IO=$MIDKERNEL_NODE_IO MIDKERNEL_AGENTFLOW_TARGET=${MIDKERNEL_AGENTFLOW_TARGET:-}" >&2
+echo "node io: prepare WORKDIR=$WORKDIR RUN_ID=${RUN_ID:-unset} MIDKERNEL_NODE_IO=$MIDKERNEL_NODE_IO MIDKERNEL_AGENTFLOW_TARGET=${MIDKERNEL_AGENTFLOW_TARGET:-} MIDKERNEL_KIMI_BIN=${MIDKERNEL_KIMI_BIN:-unset}" >&2
 
 python3 - "$OPENROUTER_SECRET_ID" "$GITHUB_TOKEN_SECRET_ID" "$AWS_REGION" <<'PY'
 import json, os, sys
@@ -526,6 +531,7 @@ def build_scan_graph(slug: str, *, description: str):
         prepare = shell(
             task_id="prepare",
             script=wrap_shell_script("prepare", prepare_script(slug), outputs=[]),
+            env=shell_io_env("prepare"),
             timeout_seconds=10 * 60,
             target=node_target(),
         )
@@ -549,6 +555,7 @@ def build_scan_graph(slug: str, *, description: str):
         publish = shell(
             task_id="publish",
             script=wrap_shell_script("publish", PUBLISH_SCRIPT.strip(), outputs=[]),
+            env=shell_io_env("publish"),
             timeout_seconds=5 * 60,
             target=node_target(cwd=review_cwd),
             success_criteria=[
@@ -823,6 +830,7 @@ def build_goal_scan_graph(slug: str, *, description: str):
         prepare = shell(
             task_id="prepare",
             script=wrap_shell_script("prepare", prepare_script(slug), outputs=[]),
+            env=shell_io_env("prepare"),
             timeout_seconds=10 * 60,
             target=node_target(),
         )
@@ -892,6 +900,7 @@ def build_goal_scan_graph(slug: str, *, description: str):
         publish = shell(
             task_id="publish",
             script=wrap_shell_script("publish", PUBLISH_SCRIPT.strip(), outputs=[]),
+            env=shell_io_env("publish"),
             timeout_seconds=5 * 60,
             target=node_target(cwd=cwd),
             success_criteria=[

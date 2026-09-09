@@ -69,4 +69,6 @@ def test_readme_documents_openrouter_lock_and_default_targets() -> None:
     assert "MIDKERNEL_NODE_IO" in readme
     assert "MIDKERNEL_KIMI_BIN" in readme
     assert "scripts/ecs-in-task.sh" in readme
+    assert "--version" in readme
+    assert "cmtuavpvs0003ib04bfyr7roc" in readme
     assert "sha256(text.trim())" in readme or "text.trim()" in readme

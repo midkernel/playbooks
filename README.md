@@ -50,6 +50,12 @@ The markdown **body** (after frontmatter) is the skill prompt. The graph loads i
 
    **Dogfood gap (run `cmtu8jtu00003l1043oi0at41`):** app compiles a Python playbook as a stub node `id=graph` (Vercel cannot exec the Graph API) and RunTask has no command override. The image then runs `midkernel-runner` — clone target + fetch `<slug>.md` + one kimi + `report.md`. `_node_io.py` never runs, so the UI shows graph unavailable. `pipelineSha` `b5083d6b…` **is** current main: the app hashes `text.trim()`, while `sha256sum pipelines/goal-security-review.py` includes the trailing newline (`bda96226…`). Not a stale revision.
 
+   **Confirmed CloudWatch (run `cmtuavpvs0003ib04bfyr7roc`):** playbooks #7 + runner #4 *did* start `agentflow run pipelines/goal-security-review.py` in-task. Bootstrap uploaded `graph.json` + every `prompt.md` (15 S3 objects), then agentflow `--preflight auto` failed `kimi_ready` for **every** Kimi node:
+
+   `Node <id> (kimi) cannot find the Kimi CLI after the node shell bootstrap; '_node_io.py --version' fails in the prepared local shell.`
+
+   Playbooks set Kimi `executable` to `pipelines/_node_io.py`. Agentflow doctor execs `<executable> --version` directly (not `python3`). That failed because the helper was not `+x` (`EACCES`) and even when executable, `main()` treated `--version` as a real node (start/finish + PATH `kimi` report.md wrapper). All nodes stayed `pending`, no `output.md` / `meta.json`, exit 1. Fix: helper is `+x`; `--version` / `--help` forward to `MIDKERNEL_KIMI_BIN` or `/opt/midkernel/kimi.bin` with no I/O; real runs still upload prompt/output.
+
 4. The graph then runs inside that task. Default playbooks (`security-review`, Solana, Firedancer) are **prepare** → **review** → **publish**. `goal-security-review` is **prepare** → **threat-model** → **goal-author** → **surface-split** → **hunter-1..N** (`GOAL_COUNT`, default 6) → **judge-a** → **judge-b** → **assemble** → **publish**. Missing, empty, or stub `report.md` fails publish; the final report key is not written.
 
 `externalAgentflowId` on the Run stays the Fargate task ARN. Observe completion the same way as today (`GET /api/runs/:id` + cron). Presign `s3://midkernel-dev-artifacts/runs/<RUN_ID>/report.md`. The Run UI also reads `graph.json` and per-node prompt/output/meta (see [Live graph artifacts](#live-graph-artifacts-run-ui)).
@@ -133,20 +139,19 @@ s3://midkernel-dev-artifacts/runs/<RUN_ID>/nodes/<nodeId>/meta.json
 
 `graph.json` nodes: `{ id, label, kind, status, startedAt?, finishedAt?, parentId?, dynamic?, artifacts }`. Edges: `{ id, source, target }`. Progress: `{ completed, total, percent, etaSeconds }` — ETA is `elapsed / completed * remaining` once at least one node has completed; otherwise `null`.
 
-Production runs are **in-task** (`MIDKERNEL_AGENTFLOW_TARGET=local`, shared disk). Graph emit (`python pipelines/*.py`, `agentflow validate`) is side-effect free: it prints PipelineSpec JSON and does not write disk or S3. Per-node I/O bootstraps when a run is actually executing — `WORKDIR` already exists and is writable, and either `RUN_ID` is set or `MIDKERNEL_NODE_IO=1`. Then `graph.json` is seeded and each node's prompt is uploaded. Shell wraps `mkdir -p "$WORKDIR"` **before** the I/O gate (prepare used to create the dir only inside the inner script). Kimi `executable` is this repo's `pipelines/_node_io.py` (always present at in-task emit), not `$WORKDIR/.midkernel/node_io.py` alone. Failed / disabled I/O and S3 PutObject errors print to stderr. Dynamic hunters (`hunter-1`…`N` from `GOAL_COUNT`) are first-class: present in `graph.json` with edges `surface-split → hunter-N → judge-a`, and re-spawned (idempotent) when `surface-split` finishes.
+Production runs are **in-task** (`MIDKERNEL_AGENTFLOW_TARGET=local`, shared disk). Graph emit (`python pipelines/*.py`, `agentflow validate`) is side-effect free: it prints PipelineSpec JSON and does not write disk or S3. Per-node I/O bootstraps when a run is actually executing — `WORKDIR` already exists and is writable, and either `RUN_ID` is set or `MIDKERNEL_NODE_IO=1`. Then `graph.json` is seeded and each node's prompt is uploaded. Shell wraps `mkdir -p "$WORKDIR"` **before** the I/O gate (prepare used to create the dir only inside the inner script). Kimi `executable` is this repo's `pipelines/_node_io.py` (always present at in-task emit; file mode `+x` so agentflow can exec `--version` without `python3`). `--version` / `--help` / `-V` / `-h` forward to `MIDKERNEL_KIMI_BIN` or `/opt/midkernel/kimi.bin` and never start/finish a node (CI emit stays side-effect free; missing image bin still exits 0 so doctor `kimi_ready` passes). Real Kimi invocations still upload prompt + output + meta. Failed / disabled I/O and S3 PutObject errors print to stderr. Dynamic hunters (`hunter-1`…`N` from `GOAL_COUNT`) are first-class: present in `graph.json` with edges `surface-split → hunter-N → judge-a`, and re-spawned (idempotent) when `surface-split` finishes.
 
-### Runner / app follow-up (required for the next ECS GOAL run)
+In-task node env also sets `BASH_ENV=/dev/null` and `MIDKERNEL_NODE_READY=1` so the published runner image hook (`BASH_ENV=/opt/midkernel/node-env.sh`) does not re-clone into a non-empty `/workspace` or install a `report.md` EXIT trap on prepare/publish. `scripts/ecs-in-task.sh` pins the same env and runs `agentflow run --preflight never` (belt; `--version` must still succeed if AUTO preflight runs).
 
-Playbooks can only write `graph.json` when the Python graph actually runs. Today that does not happen on ECS.
+### Runner / app follow-up
 
-**midkernel/runner** ([#4](https://github.com/midkernel/runner/pull/4)) must, when `pipelines/${PLAYBOOK}.py` exists (clone `midkernel/playbooks` or bake it):
+Playbooks #7 + runner #4 already start the Python graph in-task. The next GOAL ECS failure (`cmtuavpvs0003ib04bfyr7roc`) was `_node_io.py --version` (this PR). Optional defense-in-depth on a **new** runner image (not required for this playbooks fix — node env + `--preflight never` + PATH shim target the published image):
 
-1. Export `WORKDIR=/workspace`, `OUTPUTS_DIR=/outputs`, `MIDKERNEL_NODE_IO=1`, `MIDKERNEL_AGENTFLOW_TARGET=local`, `MIDKERNEL_KIMI_BIN=/opt/midkernel/kimi.bin`.
-2. `mkdir -p "$WORKDIR" "$OUTPUTS_DIR"` before `agentflow run`.
-3. Exec `scripts/ecs-in-task.sh` (or `agentflow run pipelines/${PLAYBOOK}.py`).
-4. Stop using `midkernel-default` / `midkernel-runner` (single kimi + `<slug>.md`) for playbooks that have a `pipelines/*.py` graph.
+1. `scripts/node-env.sh`: if `MIDKERNEL_AGENTFLOW_TARGET=local` or `MIDKERNEL_NODE_IO=1`, return immediately (no clone into `/workspace`, no publish EXIT trap).
+2. `scripts/kimi-wrapper.sh`: same flags → skip `midkernel-publish-report --require`; exec `$KIMI_REAL_BIN` / `kimi.bin` only.
+3. `graph.apply_graph_env`: export `MIDKERNEL_NODE_READY=1` and `BASH_ENV=/dev/null` before `agentflow run`.
 
-**midkernel/app** already sets `RUN_ID`, `PLAYBOOK`, `GOAL_COUNT`, artifacts, and hashes the pipeline as `sha256(text.trim())` (so `pipelineSha` will not match raw `sha256sum` of the file). Also set `MIDKERNEL_NODE_IO=1`, `MIDKERNEL_AGENTFLOW_TARGET=local`, `WORKDIR=/workspace` on the task env. Optional: command-override the container to `scripts/ecs-in-task.sh` instead of relying on image `CMD`.
+**midkernel/app** already sets `RUN_ID`, `PLAYBOOK`, `GOAL_COUNT`, artifacts, and hashes the pipeline as `sha256(text.trim())` (so `pipelineSha` will not match raw `sha256sum` of the file). Also set `MIDKERNEL_NODE_IO=1`, `MIDKERNEL_AGENTFLOW_TARGET=local`, `WORKDIR=/workspace`, `MIDKERNEL_KIMI_BIN=/opt/midkernel/kimi.bin` on the task env. Optional: command-override the container to `scripts/ecs-in-task.sh` instead of relying on image `CMD`.
 
 Deviation vs a purely dynamic agentflow fan-out: agentflow still needs the hunter copies declared when the graph is emitted. `GOAL_COUNT` is read then (task env), so N is exact for that run. Hunters are marked `dynamic: true` for the UI. The published ECS-per-node path (`MIDKERNEL_AGENTFLOW_TARGET=ecs`) still embeds the helper in each shell script; Kimi I/O there requires the helper file on the task disk (the in-task path is the one Midkernel actually launches).
 
