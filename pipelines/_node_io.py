@@ -50,6 +50,8 @@ REPORT_NAME = "report.md"
 GRAPH_NAME = "graph.json"
 DEFAULT_GOAL_COUNT = 6
 MAX_GOAL_HUNTERS = 6
+IMAGE_KIMI_BIN = "/opt/midkernel/kimi.bin"
+KIMI_PROBE_FLAGS = {"--version", "-V", "--help", "-h"}
 NODE_STATUSES = ("pending", "running", "completed", "failed")
 SAFE_NODE_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 SAFE_RUN_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
@@ -170,8 +172,20 @@ def kimi_executable() -> str:
     ``$WORKDIR/.midkernel/node_io.py`` only — emit-time ``install_runtime``
     is a no-op when WORKDIR is missing, which left Kimi nodes executing a
     path that did not exist (PATH ``kimi`` then ran with no per-node I/O).
+
+    Agentflow local preflight execs ``<executable> --version`` directly
+    (not ``python3 <file>``). The file must be ``+x`` or the probe gets
+    ``EACCES``, the run exits 1 after bootstrap, and prepare never starts.
+    chmod is only applied when a live run is on (CI emit stays side-effect
+    free).
     """
-    return str(source_script_path())
+    path = source_script_path()
+    if node_io_enabled():
+        try:
+            path.chmod(path.stat().st_mode | 0o111)
+        except OSError as exc:
+            print(f"node io: could not chmod +x {path}: {exc}", file=sys.stderr)
+    return str(path)
 
 
 def local_state_path() -> Path:
@@ -786,6 +800,7 @@ def install_runtime() -> Path | None:
     source = Path(__file__).read_text(encoding="utf-8")
     dest.write_text(source, encoding="utf-8")
     dest.chmod(0o755)
+    install_kimi_shim()
     return dest
 
 
@@ -811,6 +826,80 @@ def bootstrap_run_io(payload: dict[str, Any]) -> dict[str, Any]:
     return graph
 
 
+def pinned_kimi_bin() -> str:
+    """Preferred real kimi-cli. Never the PATH report.md wrapper."""
+    return env_first("MIDKERNEL_KIMI_BIN", default=IMAGE_KIMI_BIN) or IMAGE_KIMI_BIN
+
+
+def kimi_shim_dir() -> Path:
+    return runtime_dir() / "bin"
+
+
+def is_report_md_wrapper(path: str | Path) -> bool:
+    """True when *path* is the runner PATH ``kimi`` that requires report.md."""
+    candidate = Path(path)
+    try:
+        if not candidate.is_file():
+            return False
+        text = candidate.read_text(encoding="utf-8", errors="replace")[:8000]
+    except OSError:
+        return False
+    return "midkernel-publish-report" in text or "KIMI_REAL_BIN" in text
+
+
+def graph_runtime_env() -> dict[str, str]:
+    """Env that keeps in-task nodes off the runner ``BASH_ENV`` / PATH kimi hooks.
+
+    LocalRunner copies ``os.environ`` then overlays node env, so these win
+    on the already-published runner image (no new ECR build required).
+    Strings only — no disk writes. Safe to embed in emitted PipelineSpec.
+    """
+    bin_path = pinned_kimi_bin()
+    shim = str(kimi_shim_dir())
+    path = os.environ.get("PATH", "")
+    parts = [part for part in path.split(os.pathsep) if part and part != shim]
+    env = {
+        "BASH_ENV": "/dev/null",
+        "MIDKERNEL_NODE_READY": "1",
+        "MIDKERNEL_NODE_IO": "1",
+        "MIDKERNEL_KIMI_BIN": bin_path,
+        "KIMI_REAL_BIN": bin_path,
+        "PATH": os.pathsep.join([shim, *parts]) if parts else shim,
+    }
+    return env
+
+
+def shell_io_env(node_id: str) -> dict[str, str]:
+    """Env for prepare/publish so ``bash -c`` does not source node-env.sh."""
+    env = graph_runtime_env()
+    env["MIDKERNEL_NODE_ID"] = safe_node_id(node_id)
+    env["MIDKERNEL_NODE_KIND"] = "shell"
+    return env
+
+
+def install_kimi_shim() -> Path | None:
+    """``$WORKDIR/.midkernel/bin/kimi`` execs ``MIDKERNEL_KIMI_BIN``, not PATH kimi."""
+    if not node_io_enabled():
+        return None
+    dest_dir = kimi_shim_dir()
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / "kimi"
+    bin_path = pinned_kimi_bin()
+    dest.write_text(
+        "#!/bin/sh\n"
+        "# Graph shim: never the runner PATH wrapper (report.md after every node).\n"
+        f'REAL="${{MIDKERNEL_KIMI_BIN:-{bin_path}}}"\n'
+        'if [ ! -x "$REAL" ]; then\n'
+        '  echo "node io: MIDKERNEL_KIMI_BIN missing or not executable: $REAL" >&2\n'
+        "  exit 127\n"
+        "fi\n"
+        'exec "$REAL" "$@"\n',
+        encoding="utf-8",
+    )
+    dest.chmod(0o755)
+    return dest
+
+
 def wrap_shell_script(
     node_id: str,
     script: str,
@@ -830,11 +919,19 @@ def wrap_shell_script(
     parent = parent_id or ("surface-split" if is_dynamic_node(nid) else "")
     prompt_b64 = base64.b64encode(script.encode("utf-8")).decode("ascii")
     helper_src = str(source_script_path())
+    kimi_bin = pinned_kimi_bin()
     return f"""
 set -euo pipefail
 # Shared-disk contract: WORKDIR must match the task volume (image default /workspace).
 export WORKDIR="${{WORKDIR:-/workspace}}"
 export OUTPUTS_DIR="${{OUTPUTS_DIR:-/outputs}}"
+# Runner image BASH_ENV=/opt/midkernel/node-env.sh clones into /workspace
+# (non-empty after bootstrap) and installs a publish-report EXIT trap.
+# Nested bash in this script must not re-enter that hook.
+export BASH_ENV=/dev/null
+export MIDKERNEL_NODE_READY=1
+export MIDKERNEL_KIMI_BIN="${{MIDKERNEL_KIMI_BIN:-{kimi_bin}}}"
+export KIMI_REAL_BIN="${{KIMI_REAL_BIN:-$MIDKERNEL_KIMI_BIN}}"
 # Create the shared disk *before* the I/O gate. Prepare used to mkdir only
 # inside the inner script, so the wrap saw a missing WORKDIR and skipped
 # helper install for the whole node (and left Kimi executable missing).
@@ -859,7 +956,7 @@ esac
 export MIDKERNEL_NODE_IO="${{MIDKERNEL_NODE_IO:-1}}"
 if [ "$NODE_IO" = "1" ] && [ -d "$WORKDIR" ] && [ -w "$WORKDIR" ]; then
   export MIDKERNEL_NODE_IO=1
-  mkdir -p "$IO_DIR/nodes/$NODE_ID"
+  mkdir -p "$IO_DIR/nodes/$NODE_ID" "$IO_DIR/bin"
   LOG="$IO_DIR/nodes/$NODE_ID/stdout.log"
   PROMPT_FILE="$IO_DIR/nodes/$NODE_ID/prompt.md"
   python3 -c "import base64,pathlib; pathlib.Path('$PROMPT_FILE').write_bytes(base64.b64decode('{prompt_b64}'))"
@@ -867,11 +964,14 @@ if [ "$NODE_IO" = "1" ] && [ -d "$WORKDIR" ] && [ -w "$WORKDIR" ]; then
     SRC={_bash_single(helper_src)}
     if [ -f "$SRC" ]; then
       cp "$SRC" "$IO"
-      chmod 755 "$IO" || true
     fi
   fi
   if [ -f "$IO" ]; then
-    python3 "$IO" start --node "$NODE_ID" --kind {_bash_single(kind)} --label {_bash_single(label_text)} --prompt-file "$PROMPT_FILE" || true
+    chmod 755 "$IO" || echo "node io: chmod +x $IO failed" >&2
+  fi
+  if [ -f "$IO" ]; then
+    python3 "$IO" start --node "$NODE_ID" --kind {_bash_single(kind)} --label {_bash_single(label_text)} --prompt-file "$PROMPT_FILE" \
+      || echo "node io: start failed for $NODE_ID (exit $?) — continuing node body" >&2
   else
     echo "node io: helper missing at $IO (src={_bash_single(helper_src)}); skipping per-node upload" >&2
   fi
@@ -887,12 +987,15 @@ STATUS=${{PIPESTATUS[0]}}
 set -e
 if [ -n "$PROMPT_FILE" ] && [ -f "$IO" ]; then
   if [ "$STATUS" -eq 0 ]; then
-    python3 "$IO" finish --node "$NODE_ID" --status completed || true
+    python3 "$IO" finish --node "$NODE_ID" --status completed \
+      || echo "node io: finish/completed failed for $NODE_ID (exit $?)" >&2
   else
-    python3 "$IO" finish --node "$NODE_ID" --status failed --error "exit $STATUS" || true
+    python3 "$IO" finish --node "$NODE_ID" --status failed --error "exit $STATUS" \
+      || echo "node io: finish/failed upload failed for $NODE_ID (exit $?)" >&2
   fi
 fi
 if [ "$STATUS" -ne 0 ]; then
+  echo "node io: $NODE_ID exited $STATUS" >&2
   exit "$STATUS"
 fi
 """.strip()
@@ -912,16 +1015,16 @@ def kimi_io_env(
     dynamic: bool | None = None,
 ) -> dict[str, str]:
     nid = safe_node_id(node_id)
-    env = {
-        "MIDKERNEL_NODE_ID": nid,
-        "MIDKERNEL_NODE_KIND": "kimi",
-        "MIDKERNEL_NODE_LABEL": label or node_label(nid),
-        "MIDKERNEL_NODE_OUTPUTS": ",".join(outputs or []),
-        "MIDKERNEL_NODE_IO": "1",
-    }
-    image_bin = Path("/opt/midkernel/kimi.bin")
-    if image_bin.is_file() and not env_first("MIDKERNEL_KIMI_BIN"):
-        env["MIDKERNEL_KIMI_BIN"] = str(image_bin)
+    env = graph_runtime_env()
+    env.update(
+        {
+            "MIDKERNEL_NODE_ID": nid,
+            "MIDKERNEL_NODE_KIND": "kimi",
+            "MIDKERNEL_NODE_LABEL": label or node_label(nid),
+            "MIDKERNEL_NODE_OUTPUTS": ",".join(outputs or []),
+            "MIDKERNEL_NODE_IO": "1",
+        }
+    )
     if model:
         env["MIDKERNEL_NODE_MODEL"] = model
     if parent_id or is_dynamic_node(nid):
@@ -932,29 +1035,34 @@ def kimi_io_env(
 
 
 def real_kimi_bin() -> str:
+    """Resolve the real kimi-cli. Never PATH ``kimi`` (report.md wrapper)."""
+    candidates: list[Path] = []
     pinned = env_first("MIDKERNEL_KIMI_BIN")
     if pinned:
-        return pinned
-    # Runner image PATH ``kimi`` is a wrapper that requires report.md after
-    # *every* invocation. Intermediate GOAL nodes must call the real binary.
-    image_bin = Path("/opt/midkernel/kimi.bin")
-    if image_bin.is_file():
-        return str(image_bin)
-    self = source_script_path()
-    which = shutil.which("kimi")
-    if which:
-        candidate = Path(which).resolve()
-        if candidate != self:
-            return str(candidate)
-    for directory in os.environ.get("PATH", "").split(os.pathsep):
-        candidate = Path(directory) / "kimi"
+        candidates.append(Path(pinned))
+    candidates.append(Path(IMAGE_KIMI_BIN))
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
         try:
-            resolved = candidate.resolve()
+            if not candidate.is_file():
+                continue
         except OSError:
             continue
-        if candidate.is_file() and resolved != self:
-            return str(candidate)
-    return "kimi"
+        if is_report_md_wrapper(candidate):
+            print(f"node io: skipping report.md kimi wrapper at {candidate}", file=sys.stderr)
+            continue
+        return str(candidate)
+    print(
+        "node io: no real kimi binary "
+        f"(MIDKERNEL_KIMI_BIN={env_first('MIDKERNEL_KIMI_BIN')!r} "
+        f"default={IMAGE_KIMI_BIN}; PATH kimi is the runner report.md wrapper)",
+        file=sys.stderr,
+    )
+    return IMAGE_KIMI_BIN
 
 
 def _prompt_from_kimi_argv(argv: list[str]) -> str:
@@ -966,7 +1074,43 @@ def _prompt_from_kimi_argv(argv: list[str]) -> str:
     return ""
 
 
+def _is_kimi_probe(argv: list[str]) -> bool:
+    """Agentflow local preflight execs ``<executable> --version`` (or --help)."""
+    return bool(argv) and argv[0] in KIMI_PROBE_FLAGS
+
+
+def _synthetic_kimi_probe(argv: list[str]) -> int:
+    """Doctor-friendly stdout when the image bin is not on this host (CI)."""
+    if any(flag in argv for flag in ("--help", "-h")):
+        print("Usage: kimi [options]")
+        print(
+            "midkernel node_io wrap — forwards to MIDKERNEL_KIMI_BIN "
+            "or /opt/midkernel/kimi.bin"
+        )
+    else:
+        print("kimi (midkernel-node-io)")
+    return 0
+
+
+def _forward_kimi_probe(argv: list[str]) -> int:
+    """Succeed ``--version`` / ``--help`` without node I/O (CI / doctor)."""
+    binary = real_kimi_bin()
+    if Path(binary).is_file() and os.access(binary, os.X_OK) and not is_report_md_wrapper(binary):
+        print(f"node io: kimi probe → {binary} {' '.join(argv)}", file=sys.stderr)
+        try:
+            return int(subprocess.run([binary, *argv], check=False).returncode)
+        except OSError as exc:
+            print(f"node io: kimi probe failed ({binary}): {exc}", file=sys.stderr)
+    elif is_report_md_wrapper(binary):
+        print(f"node io: refusing PATH kimi wrapper for probe: {binary}", file=sys.stderr)
+    else:
+        print(f"node io: kimi probe synthetic (no real bin at {binary})", file=sys.stderr)
+    return _synthetic_kimi_probe(argv)
+
+
 def wrap_kimi(argv: list[str]) -> int:
+    if _is_kimi_probe(argv):
+        return _forward_kimi_probe(argv)
     node_id = env_first("MIDKERNEL_NODE_ID") or "kimi"
     prompt = _prompt_from_kimi_argv(argv)
     if node_io_enabled():
@@ -980,7 +1124,13 @@ def wrap_kimi(argv: list[str]) -> int:
         parent_id=env_first("MIDKERNEL_NODE_PARENT") or None,
         dynamic=env_first("MIDKERNEL_NODE_DYNAMIC") == "1" or None,
     )
-    command = [real_kimi_bin(), *argv]
+    binary = real_kimi_bin()
+    if is_report_md_wrapper(binary):
+        error = f"refusing PATH kimi wrapper: {binary} (set MIDKERNEL_KIMI_BIN={IMAGE_KIMI_BIN})"
+        print(f"node io: {error}", file=sys.stderr)
+        finish_node(node_id, status="failed", error=error)
+        return 1
+    command = [binary, *argv]
     error = None
     try:
         result = subprocess.run(command, check=False)
@@ -988,7 +1138,7 @@ def wrap_kimi(argv: list[str]) -> int:
     except Exception as exc:  # noqa: BLE001
         code = 1
         error = str(exc)
-        print(f"node io: kimi wrapper failed: {exc}", file=sys.stderr)
+        print(f"node io: kimi wrapper failed ({binary}): {exc}", file=sys.stderr)
     status = "completed" if code == 0 else "failed"
     if code != 0 and not error:
         error = f"exit {code}"

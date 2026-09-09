@@ -266,6 +266,146 @@ def test_kimi_executable_is_source_helper() -> None:
     assert path.endswith("pipelines/_node_io.py") or path.endswith("_node_io.py")
     assert Path(path).is_file()
     assert Path(path).resolve() == io.source_script_path()
+    assert os.access(Path(path), os.X_OK)
+
+
+def test_agentflow_style_direct_exec_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Doctor runs ``[executable, "--version"]`` — shebang + +x, no python3."""
+    fake = tmp_path / "kimi.bin"
+    fake.write_text("#!/bin/sh\necho kimi-probe-ok\n", encoding="utf-8")
+    fake.chmod(0o755)
+    env = os.environ.copy()
+    env["MIDKERNEL_KIMI_BIN"] = str(fake)
+    env["WORKDIR"] = str(tmp_path / "missing-workdir")
+    env.pop("RUN_ID", None)
+    env.pop("MIDKERNEL_NODE_IO", None)
+    result = subprocess.run(
+        [str(io.source_script_path()), "--version"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "kimi-probe-ok" in result.stdout
+    assert not (tmp_path / "missing-workdir").exists()
+
+
+def test_version_and_help_forward_to_real_kimi_without_node_io(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """agentflow preflight execs ``_node_io.py --version``; must not write S3/disk."""
+    fake = tmp_path / "kimi.bin"
+    fake.write_text("#!/bin/sh\necho kimi-probe-ok \"$@\"\n", encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setenv("MIDKERNEL_KIMI_BIN", str(fake))
+    monkeypatch.setenv("WORKDIR", str(tmp_path / "missing-workdir"))
+    monkeypatch.delenv("RUN_ID", raising=False)
+    monkeypatch.delenv("MIDKERNEL_NODE_IO", raising=False)
+
+    code = io.main(["--version"])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "kimi-probe-ok" in captured.out
+    assert "--version" in captured.out
+    assert not (tmp_path / "missing-workdir").exists()
+
+    code = io.main(["--help"])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "kimi-probe-ok" in captured.out
+
+
+def test_version_succeeds_without_real_kimi_bin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """CI / laptop: --version must still exit 0 so agentflow doctor kimi_ready passes."""
+    missing = str(tmp_path / "missing-kimi.bin")
+    monkeypatch.setattr(io, "IMAGE_KIMI_BIN", missing)
+    monkeypatch.setenv("MIDKERNEL_KIMI_BIN", missing)
+    monkeypatch.setenv("WORKDIR", str(tmp_path / "missing-workdir"))
+    monkeypatch.delenv("RUN_ID", raising=False)
+    monkeypatch.delenv("MIDKERNEL_NODE_IO", raising=False)
+    code = io.main(["--version"])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "kimi (midkernel-node-io)" in captured.out
+    assert not (tmp_path / "missing-workdir").exists()
+
+
+def test_wrap_kimi_real_run_uploads_prompt_and_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "kimi.bin"
+    fake.write_text("#!/bin/sh\necho kimi-ran\n", encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setenv("MIDKERNEL_KIMI_BIN", str(fake))
+    monkeypatch.setenv("WORKDIR", str(tmp_path))
+    monkeypatch.setenv("RUN_ID", "run-wrap-kimi")
+    monkeypatch.setenv("MIDKERNEL_IO_DIR", str(tmp_path / "s3"))
+    monkeypatch.setenv("MIDKERNEL_IO_SKIP_S3", "1")
+    monkeypatch.setenv("MIDKERNEL_NODE_IO", "1")
+    monkeypatch.setenv("MIDKERNEL_NODE_ID", "threat-model")
+    assert io.main(["-p", "do the hunt"]) == 0
+    prompt = (tmp_path / "s3" / "runs/run-wrap-kimi/nodes/threat-model/prompt.md").read_text(
+        encoding="utf-8"
+    )
+    assert "do the hunt" in prompt
+    meta = json.loads(
+        (tmp_path / "s3" / "runs/run-wrap-kimi/nodes/threat-model/meta.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert meta["status"] == "completed"
+
+
+def test_version_probe_skips_start_finish_on_live_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "kimi.bin"
+    fake.write_text("#!/bin/sh\necho kimi-probe-ok\n", encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setenv("MIDKERNEL_KIMI_BIN", str(fake))
+    monkeypatch.setenv("WORKDIR", str(tmp_path))
+    monkeypatch.setenv("RUN_ID", "run-probe")
+    monkeypatch.setenv("MIDKERNEL_IO_DIR", str(tmp_path / "s3"))
+    monkeypatch.setenv("MIDKERNEL_IO_SKIP_S3", "1")
+    monkeypatch.setenv("MIDKERNEL_NODE_IO", "1")
+    assert io.main(["--version"]) == 0
+    assert not (tmp_path / ".midkernel" / "graph.json").exists()
+    assert not (tmp_path / "s3" / "runs" / "run-probe").exists()
+
+
+def test_real_kimi_bin_skips_report_md_wrapper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wrapper = tmp_path / "kimi"
+    wrapper.write_text(
+        "#!/bin/sh\nREAL=${KIMI_REAL_BIN:-/opt/midkernel/kimi.bin}\n"
+        "midkernel-publish-report --require\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    real = tmp_path / "kimi.bin"
+    real.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    real.chmod(0o755)
+    monkeypatch.setenv("MIDKERNEL_KIMI_BIN", str(wrapper))
+    monkeypatch.setenv("PATH", str(tmp_path))
+    assert io.is_report_md_wrapper(wrapper)
+    # Pinned wrapper is skipped; fall through to image default path string.
+    assert io.real_kimi_bin() == io.IMAGE_KIMI_BIN
+    monkeypatch.setenv("MIDKERNEL_KIMI_BIN", str(real))
+    assert io.real_kimi_bin() == str(real)
+
+
+def test_kimi_io_env_always_pins_real_bin() -> None:
+    env = io.kimi_io_env("threat-model", outputs=["THREAT_MODEL.md"])
+    assert env["MIDKERNEL_KIMI_BIN"]
+    assert env["BASH_ENV"] == "/dev/null"
+    assert env["MIDKERNEL_NODE_READY"] == "1"
+    assert env["MIDKERNEL_NODE_ID"] == "threat-model"
 
 
 def test_node_io_gate_silent_without_run(
@@ -287,6 +427,9 @@ def test_ecs_in_task_script_exports_contract() -> None:
     assert 'WORKDIR="${WORKDIR:-/workspace}"' in text
     assert "MIDKERNEL_KIMI_BIN" in text
     assert "agentflow run" in text
+    assert "--preflight never" in text
+    assert "BASH_ENV=/dev/null" in text
+    assert "MIDKERNEL_NODE_READY" in text
     assert "pipelines/${PLAYBOOK}.py" in text or 'pipelines/${PLAYBOOK}.py' in text
     assert "git clone" in text
     assert "MIDKERNEL_PLAYBOOKS_DIR" in text

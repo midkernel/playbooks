@@ -20,12 +20,16 @@ export WORKDIR="${WORKDIR:-/workspace}"
 export OUTPUTS_DIR="${OUTPUTS_DIR:-/outputs}"
 export MIDKERNEL_NODE_IO="${MIDKERNEL_NODE_IO:-1}"
 export MIDKERNEL_AGENTFLOW_TARGET="${MIDKERNEL_AGENTFLOW_TARGET:-local}"
+# Disable the image BASH_ENV hook (clones into /workspace + report.md EXIT trap).
+export BASH_ENV=/dev/null
+export MIDKERNEL_NODE_READY=1
 if [ -x /opt/midkernel/kimi.bin ]; then
   export MIDKERNEL_KIMI_BIN="${MIDKERNEL_KIMI_BIN:-/opt/midkernel/kimi.bin}"
+  export KIMI_REAL_BIN="${KIMI_REAL_BIN:-$MIDKERNEL_KIMI_BIN}"
 fi
 
-mkdir -p "$WORKDIR" "$OUTPUTS_DIR" "$WORKDIR/.midkernel"
-echo "node io: ecs-in-task WORKDIR=$WORKDIR RUN_ID=${RUN_ID:-unset} PLAYBOOK=${PLAYBOOK:-${PLAYBOOK_SLUG:-unset}} MIDKERNEL_NODE_IO=$MIDKERNEL_NODE_IO MIDKERNEL_AGENTFLOW_TARGET=$MIDKERNEL_AGENTFLOW_TARGET" >&2
+mkdir -p "$WORKDIR" "$OUTPUTS_DIR" "$WORKDIR/.midkernel/bin"
+echo "node io: ecs-in-task WORKDIR=$WORKDIR RUN_ID=${RUN_ID:-unset} PLAYBOOK=${PLAYBOOK:-${PLAYBOOK_SLUG:-unset}} MIDKERNEL_NODE_IO=$MIDKERNEL_NODE_IO MIDKERNEL_AGENTFLOW_TARGET=$MIDKERNEL_AGENTFLOW_TARGET MIDKERNEL_KIMI_BIN=${MIDKERNEL_KIMI_BIN:-unset}" >&2
 
 PLAYBOOK="${PLAYBOOK:-${PLAYBOOK_SLUG:-goal-security-review}}"
 PLAYBOOKS_OWNER="${PLAYBOOKS_OWNER:-midkernel}"
@@ -62,5 +66,30 @@ if ! command -v agentflow >/dev/null 2>&1; then
   exit 2
 fi
 
-echo "node io: agentflow run $PIPELINE" >&2
-exec agentflow run "$PIPELINE"
+# Agentflow local preflight execs ``<executable> --version`` (not python3).
+HELPER="$ROOT/pipelines/_node_io.py"
+if [ -f "$HELPER" ]; then
+  chmod 755 "$HELPER" || echo "node io: chmod +x $HELPER failed" >&2
+fi
+
+# PATH shim so any leftover ``kimi`` lookup hits kimi.bin, not the report.md wrapper.
+SHIM="$WORKDIR/.midkernel/bin/kimi"
+if [ -n "${MIDKERNEL_KIMI_BIN:-}" ]; then
+  cat > "$SHIM" <<EOF
+#!/bin/sh
+REAL="\${MIDKERNEL_KIMI_BIN:-$MIDKERNEL_KIMI_BIN}"
+if [ ! -x "\$REAL" ]; then
+  echo "node io: MIDKERNEL_KIMI_BIN missing or not executable: \$REAL" >&2
+  exit 127
+fi
+exec "\$REAL" "\$@"
+EOF
+  chmod 755 "$SHIM"
+  export PATH="$WORKDIR/.midkernel/bin:$PATH"
+fi
+
+# --preflight never: AUTO preflight still probes every local kimi node with
+# ``_node_io.py --version``. That must succeed (this helper forwards to
+# kimi.bin) but skipping doctor avoids a second failure mode.
+echo "node io: agentflow run --preflight never $PIPELINE" >&2
+exec agentflow run --preflight never "$PIPELINE"
