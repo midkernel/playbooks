@@ -291,7 +291,17 @@ def test_goal_graph_hunters_follow_goal_count(monkeypatch: pytest.MonkeyPatch) -
     assert "hunter-4" not in nodes
     assert nodes["hunter-1"]["env"]["MIDKERNEL_NODE_DYNAMIC"] == "1"
     assert nodes["hunter-1"]["env"]["MIDKERNEL_NODE_PARENT"] == "surface-split"
+    assert nodes["hunter-1"]["depends_on"] == ["surface-split"]
+    assert nodes["hunter-2"]["depends_on"] == ["hunter-1"]
+    assert nodes["hunter-3"]["depends_on"] == ["hunter-2"]
+    ready_after_split = [
+        hid
+        for hid in ("hunter-1", "hunter-2", "hunter-3")
+        if set(nodes[hid]["depends_on"]) <= {"surface-split"}
+    ]
+    assert ready_after_split == ["hunter-1"]
     assert set(nodes["judge-a"]["depends_on"]) == {"hunter-1", "hunter-2", "hunter-3"}
+    assert graph.to_payload()["concurrency"] == 1
 
 
 def test_review_prompt_names_default_targets() -> None:

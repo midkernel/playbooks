@@ -859,12 +859,30 @@ def assemble_prompt(slug: str) -> str:
     )
 
 
+def chain_goal_hunters(split, hunters) -> None:
+    """Serialize hunter-1..N: ``split → hunter-1 → hunter-2 → … → hunter-N``.
+
+    Parallel ``split >> hunters`` is the OpenRouter 429 root cause on new
+    accounts (20 RPM for ``moonshotai/kimi-k3``, run
+    ``cmtun51000003l704q7lyyjrf``, ``limit_source=openrouter_new_account``).
+    Agentflow has no hunter-group concurrency knob; a ``depends_on`` chain is
+    the supported way to keep one hunter on the wire at a time. Do not restore
+    the fan-out.
+    """
+    if not hunters:
+        return
+    split >> hunters[0]
+    for earlier, later in zip(hunters, hunters[1:]):
+        earlier >> later
+
+
 def build_goal_scan_graph(slug: str, *, description: str):
     """prepare → threat-model → goal-author → surface-split → hunters → judges → assemble → publish.
 
     Hunters are first-class dynamic nodes ``hunter-1``…``hunter-N`` from
-    ``GOAL_COUNT`` (default 6, max 6). Each picks ``goals/0N-*.md`` if present
-    and no-ops cleanly if missing. Known-issues / GitHub dedupe is omitted.
+    ``GOAL_COUNT`` (default 6, max 6). They run as a ``depends_on`` chain
+    (never in parallel). Each picks ``goals/0N-*.md`` if present and no-ops
+    cleanly if missing. Known-issues / GitHub dedupe is omitted.
     """
     from agentflow import Graph, shell
 
@@ -878,7 +896,7 @@ def build_goal_scan_graph(slug: str, *, description: str):
         slug,
         description=description,
         working_dir=".",
-        concurrency=max(hunters_n, 1),
+        concurrency=1,
         fail_fast=True,
     ) as graph:
         prepare = shell(
@@ -962,7 +980,7 @@ def build_goal_scan_graph(slug: str, *, description: str):
             ],
         )
         prepare >> threat >> author >> split
-        split >> hunters
+        chain_goal_hunters(split, hunters)
         hunters >> relevance >> exploit >> assemble >> publish
     return graph
 
