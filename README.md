@@ -139,7 +139,7 @@ Production runs are **in-task** (`MIDKERNEL_AGENTFLOW_TARGET=local`, shared disk
 
 Playbooks can only write `graph.json` when the Python graph actually runs. Today that does not happen on ECS.
 
-**midkernel/runner** (companion PR) must, when `pipelines/${PLAYBOOK}.py` exists (clone `midkernel/playbooks` or bake it):
+**midkernel/runner** ([#4](https://github.com/midkernel/runner/pull/4)) must, when `pipelines/${PLAYBOOK}.py` exists (clone `midkernel/playbooks` or bake it):
 
 1. Export `WORKDIR=/workspace`, `OUTPUTS_DIR=/outputs`, `MIDKERNEL_NODE_IO=1`, `MIDKERNEL_AGENTFLOW_TARGET=local`, `MIDKERNEL_KIMI_BIN=/opt/midkernel/kimi.bin`.
 2. `mkdir -p "$WORKDIR" "$OUTPUTS_DIR"` before `agentflow run`.
