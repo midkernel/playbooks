@@ -288,6 +288,8 @@ def test_ecs_in_task_script_exports_contract() -> None:
     assert "MIDKERNEL_KIMI_BIN" in text
     assert "agentflow run" in text
     assert "pipelines/${PLAYBOOK}.py" in text or 'pipelines/${PLAYBOOK}.py' in text
+    assert "git clone" in text
+    assert "MIDKERNEL_PLAYBOOKS_DIR" in text
 
 
 def test_utc_now_is_zulu() -> None:
