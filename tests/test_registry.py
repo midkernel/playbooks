@@ -68,6 +68,11 @@ def test_readme_documents_openrouter_lock_and_default_targets() -> None:
     assert "nodes/<nodeId>/meta.json" in readme
     assert "MIDKERNEL_NODE_IO" in readme
     assert "MIDKERNEL_KIMI_BIN" in readme
+    assert "KIMI_MAX_TOKENS" in readme
+    assert "OPENROUTER_MAX_TOKENS" in readme
+    assert "32768" in readme
+    assert "cmtufzqzo0003k004mt2w0m9c" in readme
+    assert "in_flight_budget_exhausted" in readme
     assert "scripts/ecs-in-task.sh" in readme
     assert "--version" in readme
     assert "cmtuavpvs0003ib04bfyr7roc" in readme

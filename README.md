@@ -104,6 +104,7 @@ Coordinate names with `midkernel/app` (`src/lib/agentflow-contract.ts`) and `mid
 | `ARTIFACTS_PREFIX` | same | no | Default `runs/` |
 | `ARTIFACTS_KEY` | same | no | Default `runs/<RUN_ID>/report.md` |
 | `MODEL` / `OPENROUTER_MODEL` | `OPENROUTER_MODEL` | no | OpenRouter slug, default `moonshotai/kimi-k3` (optional `openrouter/` prefix) |
+| `KIMI_MAX_TOKENS` / `OPENROUTER_MAX_TOKENS` | same, plus kimi-cli `KIMI_MODEL_MAX_COMPLETION_TOKENS` / `KIMI_MODEL_MAX_TOKENS` | no | Per-request OpenRouter generation cap (`max_tokens`). Default **32768**. Baked onto every Kimi node in `emit()` / `emit_goal()` (review, threat-model, hunters, judges, assemble). `0` / negative are ignored (kimi-cli would disable the clamp). **131072 is never implicit** — set the env explicitly to opt in. See [OpenRouter `max_tokens` cap](#openrouter-max_tokens-cap-402) |
 | `GITHUB_REF` | same | no | Shallow clone `--branch`. Playbooks with `target_ref` default that ref |
 | `GITHUB_TOKEN` | same | yes* | Installation token; else SM `midkernel/dev/harness/github-token` |
 | `OPENROUTER_API_KEY` | same | yes* | Else SM `midkernel/dev/harness/openrouter-api-key` |
@@ -126,10 +127,23 @@ export KIMI_SHARE_DIR="$WORKDIR/.midkernel/kimi"
 
 In-task Kimi nodes (`executable` = `pipelines/_node_io.py`) set `BASH_ENV=/dev/null` so the runner `node-env.sh` hook does not re-clone. That skips runner `prepare_node` on review / threat-model / hunters. Playbooks therefore:
 
-1. Bake `OPENAI_BASE_URL`, `OPENROUTER_MODEL`, `KIMI_SHARE_DIR`, `HOME`, and any emit-time OpenRouter keys onto **every** Kimi node env (`kimi_io_env` / `openrouter_node_env`).
+1. Bake `OPENAI_BASE_URL`, `OPENROUTER_MODEL`, `KIMI_SHARE_DIR`, `HOME`, the `max_tokens` cap (`KIMI_MAX_TOKENS` / `OPENROUTER_MAX_TOKENS`), and any emit-time OpenRouter keys onto **every** Kimi node env (`kimi_io_env` / `openrouter_node_env`).
 2. Pass `extra_args=["--config", "$WORKDIR/.midkernel/kimi/config.toml"]` — a **file path**. Inline TOML made kimi.bin print `LLM not set` (runs `cmtudf0470003jp040742shv6`, `cmtudm8f20003i90462yr3vxq`).
-3. `wrap_kimi` rewrites a non-file `--config`, writes that TOML, and forwards the OpenRouter env to `MIDKERNEL_KIMI_BIN`.
+3. `wrap_kimi` rewrites a non-file `--config`, writes that TOML (including `max_output_size`), starts a localhost proxy that injects `max_tokens` on every `chat/completions` body, and forwards the OpenRouter env to `MIDKERNEL_KIMI_BIN`.
 4. Prepare also writes `$WORKDIR/.midkernel-openrouter` + `$WORKDIR/.midkernel/kimi/config.toml` (cwd for later nodes is `$WORKDIR/repo`).
+
+### OpenRouter `max_tokens` cap (402)
+
+**Confirmed CloudWatch (run `cmtufzqzo0003k004mt2w0m9c`):** prepare / threat-model / goal-author / surface-split succeeded. `hunter-1`…`hunter-6` all exited 1 with empty `output.md` and no `RESULT.md`. stderr showed kimi-openrouter config + `key_set=yes`. OpenRouter returned **402 `in_flight_budget_exhausted`**; `previous_errors` were also 402 saying the request reserved `max_tokens` up to **131072** but the key could only afford ~68k–120k. Judges / assemble / publish never ran; no `report.md`.
+
+Root cause (not a retry tweak): Midkernel config sets `max_context_size = 262144` and does not send a generation limit. kimi-cli `openai_legacy` (OpenRouter) does **not** apply `KIMI_MODEL_MAX_COMPLETION_TOKENS` or `max_output_size` — those knobs are native-Kimi / Anthropic only. OpenRouter then reserves the model catalog / remaining-context default of **131072** against in-flight budget.
+
+Definitive playbooks patch:
+
+1. Default `max_tokens` **32768** on every Kimi invocation in `emit()` / `emit_goal()`.
+2. Env override: `KIMI_MAX_TOKENS` or `OPENROUTER_MAX_TOKENS` (also accepts kimi-cli `KIMI_MODEL_MAX_COMPLETION_TOKENS` / `KIMI_MODEL_MAX_TOKENS`). 131072 only if set explicitly.
+3. `wrap_kimi` proxies OpenRouter and **always writes `max_tokens`** on `chat/completions` so the HTTP body cannot 402 from an omitted/131072 reservation.
+4. Hunter success criteria still require `findings/hunter-N/RESULT.md`. Wrap uploads that file when the model actually writes it. Wrap does **not** invent findings or a stub `RESULT.md` on 402 / empty return.
 
 Harness secrets are never in git. Image/task role may `GetSecretValue` on the two SM names above and `PutObject` on the artifacts prefix (`runs/<RUN_ID>/` including `graph.json` and `nodes/<id>/`).
 

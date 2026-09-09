@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
+import urllib.request
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -400,7 +403,14 @@ def test_real_kimi_bin_skips_report_md_wrapper(
     assert io.real_kimi_bin() == str(real)
 
 
-def test_kimi_io_env_always_pins_real_bin() -> None:
+def test_kimi_io_env_always_pins_real_bin(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in (
+        "KIMI_MAX_TOKENS",
+        "OPENROUTER_MAX_TOKENS",
+        "KIMI_MODEL_MAX_COMPLETION_TOKENS",
+        "KIMI_MODEL_MAX_TOKENS",
+    ):
+        monkeypatch.delenv(name, raising=False)
     env = io.kimi_io_env("threat-model", outputs=["THREAT_MODEL.md"])
     assert env["MIDKERNEL_KIMI_BIN"]
     assert env["BASH_ENV"] == "/dev/null"
@@ -423,6 +433,8 @@ def test_kimi_io_env_passes_openrouter_keys(monkeypatch: pytest.MonkeyPatch, tmp
     assert env["HOME"] == str(tmp_path / "home")
     assert env["OPENROUTER_MODEL"] == "anthropic/claude-sonnet-4.5"
     assert env["KIMI_SHARE_DIR"] == str(tmp_path / ".midkernel" / "kimi")
+    assert env["KIMI_MAX_TOKENS"] == "32768"
+    assert env["OPENROUTER_MAX_TOKENS"] == "32768"
 
 
 def test_ensure_kimi_config_rewrites_inline_toml(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -441,6 +453,8 @@ def test_ensure_kimi_config_rewrites_inline_toml(tmp_path: Path, monkeypatch: py
     assert "openai_legacy" in text
     assert "sk-or-live" in text
     assert "moonshotai/kimi-k3" in text
+    assert "max_output_size = 32768" in text
+    assert "131072" not in text
 
 
 def test_resolve_openrouter_key_from_workdir_file(
@@ -485,3 +499,115 @@ def test_utc_now_is_zulu() -> None:
     stamp = io.utc_now()
     parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
     assert parsed.tzinfo == timezone.utc
+
+
+def test_cap_openrouter_payload_never_leaves_131072() -> None:
+    cap = io.DEFAULT_KIMI_MAX_TOKENS
+    injected = io.cap_openrouter_payload({"model": "moonshotai/kimi-k3"}, cap)
+    assert injected["max_tokens"] == 32768
+    clamped = io.cap_openrouter_payload(
+        {"max_tokens": io.UNSAFE_OPENROUTER_MAX_TOKENS, "max_completion_tokens": 200000},
+        cap,
+    )
+    assert clamped["max_tokens"] == 32768
+    assert clamped["max_completion_tokens"] == 32768
+    kept = io.cap_openrouter_payload({"max_tokens": 1024}, cap)
+    assert kept["max_tokens"] == 1024
+    zeroed = io.cap_openrouter_payload({"max_tokens": 0}, cap)
+    assert zeroed["max_tokens"] == 32768
+
+
+def test_openrouter_proxy_injects_max_tokens() -> None:
+    received: dict[str, object] = {}
+
+    class Upstream(BaseHTTPRequestHandler):
+        def log_message(self, fmt: str, *args: object) -> None:
+            return
+
+        def do_POST(self) -> None:  # noqa: N802
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length)
+            received["path"] = self.path
+            received["body"] = json.loads(raw.decode("utf-8"))
+            payload = b'{"id":"ok"}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+    thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+    thread.start()
+    try:
+        _host, port = upstream.server_address
+        proxy = io.OpenRouterMaxTokensProxy(
+            32768, upstream_base=f"http://127.0.0.1:{int(port)}/api/v1"
+        )
+        base = proxy.start()
+        try:
+            req = urllib.request.Request(
+                f"{base}/chat/completions",
+                data=json.dumps({"model": "moonshotai/kimi-k3", "max_tokens": 131072}).encode(),
+                method="POST",
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                assert resp.status == 200
+            assert received["body"]["max_tokens"] == 32768
+            assert received["path"].endswith("/chat/completions")
+        finally:
+            proxy.stop()
+    finally:
+        upstream.shutdown()
+        upstream.server_close()
+
+
+def test_wrap_kimi_does_not_invent_hunter_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "kimi.bin"
+    fake.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setenv("MIDKERNEL_KIMI_BIN", str(fake))
+    monkeypatch.setenv("WORKDIR", str(tmp_path))
+    monkeypatch.setenv("RUN_ID", "run-hunter-fail")
+    monkeypatch.setenv("MIDKERNEL_IO_DIR", str(tmp_path / "s3"))
+    monkeypatch.setenv("MIDKERNEL_IO_SKIP_S3", "1")
+    monkeypatch.setenv("MIDKERNEL_NODE_IO", "1")
+    monkeypatch.setenv("MIDKERNEL_NODE_ID", "hunter-1")
+    monkeypatch.setenv("MIDKERNEL_NODE_OUTPUTS", "findings/hunter-1/RESULT.md")
+    assert io.main(["-p", "hunt"]) == 1
+    result = tmp_path / "repo" / "findings" / "hunter-1" / "RESULT.md"
+    assert not result.exists()
+    assert not (tmp_path / "findings" / "hunter-1" / "RESULT.md").exists()
+
+
+def test_wrap_kimi_uploads_result_when_model_writes_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dest = tmp_path / "repo" / "findings" / "hunter-1" / "RESULT.md"
+    fake = tmp_path / "kimi.bin"
+    fake.write_text(
+        "#!/bin/sh\n"
+        f"mkdir -p '{dest.parent}'\n"
+        f"printf '%s\\n' 'clean miss: read goals/01 and THREAT_MODEL.md' > '{dest}'\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    monkeypatch.setenv("MIDKERNEL_KIMI_BIN", str(fake))
+    monkeypatch.setenv("WORKDIR", str(tmp_path))
+    monkeypatch.setenv("RUN_ID", "run-hunter-ok")
+    monkeypatch.setenv("MIDKERNEL_IO_DIR", str(tmp_path / "s3"))
+    monkeypatch.setenv("MIDKERNEL_IO_SKIP_S3", "1")
+    monkeypatch.setenv("MIDKERNEL_NODE_IO", "1")
+    monkeypatch.setenv("MIDKERNEL_NODE_ID", "hunter-1")
+    monkeypatch.setenv("MIDKERNEL_NODE_OUTPUTS", "findings/hunter-1/RESULT.md")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    assert io.main(["-p", "hunt"]) == 0
+    assert dest.is_file()
+    output = (tmp_path / "s3" / "runs/run-hunter-ok/nodes/hunter-1/output.md").read_text(
+        encoding="utf-8"
+    )
+    assert "clean miss" in output
+    assert "invent" not in output.lower()
