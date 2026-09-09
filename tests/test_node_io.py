@@ -294,7 +294,7 @@ def test_agentflow_style_direct_exec_version(
 
 
 def test_version_and_help_forward_to_real_kimi_without_node_io(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
 ) -> None:
     """agentflow preflight execs ``_node_io.py --version``; must not write S3/disk."""
     fake = tmp_path / "kimi.bin"
@@ -306,14 +306,14 @@ def test_version_and_help_forward_to_real_kimi_without_node_io(
     monkeypatch.delenv("MIDKERNEL_NODE_IO", raising=False)
 
     code = io.main(["--version"])
-    captured = capsys.readouterr()
+    captured = capfd.readouterr()
     assert code == 0
     assert "kimi-probe-ok" in captured.out
     assert "--version" in captured.out
     assert not (tmp_path / "missing-workdir").exists()
 
     code = io.main(["--help"])
-    captured = capsys.readouterr()
+    captured = capfd.readouterr()
     assert code == 0
     assert "kimi-probe-ok" in captured.out
 
