@@ -37,6 +37,20 @@ def test_openrouter_model_strips_provider_prefix(monkeypatch: pytest.MonkeyPatch
     assert mk.openrouter_model() == "moonshotai/kimi-k3"
 
 
+def test_openrouter_model_default_is_balanced_pareto_preset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENROUTER_MODEL", raising=False)
+    monkeypatch.delenv("MODEL", raising=False)
+    assert mk.DEFAULT_OPENROUTER_MODEL == "google/gemini-3.8-flash"
+    assert mk.openrouter_model() == "google/gemini-3.8-flash"
+    # App injects per-profile via either env name.
+    monkeypatch.setenv("MODEL", "openrouter/moonshotai/kimi-k3")
+    assert mk.openrouter_model() == "moonshotai/kimi-k3"
+    monkeypatch.setenv("OPENROUTER_MODEL", "anthropic/claude-sonnet-4.5")
+    assert mk.openrouter_model() == "anthropic/claude-sonnet-4.5"
+
+
 def test_env_aliases(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("PLAYBOOK", raising=False)
     monkeypatch.setenv("PLAYBOOK_SLUG", "solana-validator-security")
@@ -182,6 +196,11 @@ def test_prepare_script_bakes_playbook_defaults() -> None:
     assert "$WORKDIR/.midkernel-openrouter" in security
     assert "max_tokens = ${KIMI_MAX_TOKENS}" in security
     assert "max_output_size = ${KIMI_MAX_TOKENS}" in security
+    assert (
+        'OPENROUTER_MODEL="${OPENROUTER_MODEL:-${MODEL:-google/gemini-3.8-flash}}"'
+        in security
+    )
+    assert "moonshotai/kimi-k3" not in security
     assert "KIMI_MAX_TOKENS=" in security
     assert "MIDKERNEL_OPENROUTER_MAX_TOKENS=" in security
     assert (
@@ -222,7 +241,7 @@ def test_judge_models_stay_distinct_by_default(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.delenv("JUDGE_B_MODEL", raising=False)
     monkeypatch.delenv("OPENROUTER_MODEL", raising=False)
     monkeypatch.delenv("MODEL", raising=False)
-    assert mk.judge_a_model() == "moonshotai/kimi-k3"
+    assert mk.judge_a_model() == "google/gemini-3.8-flash"
     assert mk.judge_b_model() == "anthropic/claude-sonnet-4.5"
     monkeypatch.setenv("OPENROUTER_MODEL", "anthropic/claude-sonnet-4.5")
     assert mk.judge_a_model() == "anthropic/claude-sonnet-4.5"

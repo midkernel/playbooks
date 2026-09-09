@@ -64,7 +64,9 @@ MAX_GOAL_HUNTERS = 6
 IMAGE_KIMI_BIN = "/opt/midkernel/kimi.bin"
 KIMI_PROBE_FLAGS = {"--version", "-V", "--help", "-h"}
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-DEFAULT_OPENROUTER_MODEL = "moonshotai/kimi-k3"
+# Fallback only. App SCAN_MODEL_BY_PROFILE injects OPENROUTER_MODEL / MODEL
+# per Scan profile. Balanced Pareto Scan preset is the documented default.
+DEFAULT_OPENROUTER_MODEL = "google/gemini-3.8-flash"
 OPENROUTER_KEY_PLACEHOLDER = "OVERRIDE_VIA_ENV"
 # Safe per-request generation cap. kimi.bin / OpenRouter otherwise reserve the
 # model catalog (or remaining-context) default of 131072, which 402s typical

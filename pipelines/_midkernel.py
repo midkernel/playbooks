@@ -69,7 +69,9 @@ ARTIFACTS_BUCKET = "midkernel-dev-artifacts"
 ARTIFACTS_PREFIX = "runs/"
 REPORT_NAME = "report.md"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-DEFAULT_OPENROUTER_MODEL = "moonshotai/kimi-k3"
+# Fallback only. App SCAN_MODEL_BY_PROFILE injects OPENROUTER_MODEL / MODEL
+# per Scan profile. Balanced Pareto Scan preset is the documented default.
+DEFAULT_OPENROUTER_MODEL = "google/gemini-3.8-flash"
 DEFAULT_PLAYBOOKS_REPO = "https://github.com/midkernel/playbooks"
 DEFAULT_GOAL_COUNT = 6
 MAX_GOAL_HUNTERS = 6
@@ -380,7 +382,7 @@ PROFILE="${PROFILE:-${SCAN_PROFILE:-balanced}}"
 THREAT="${THREAT:-${THREAT_PIN:-}}"
 ARTIFACTS_BUCKET="${ARTIFACTS_BUCKET:-midkernel-dev-artifacts}"
 ARTIFACTS_PREFIX="${ARTIFACTS_PREFIX:-runs/}"
-OPENROUTER_MODEL="${OPENROUTER_MODEL:-${MODEL:-moonshotai/kimi-k3}}"
+OPENROUTER_MODEL="${OPENROUTER_MODEL:-${MODEL:-__DEFAULT_OPENROUTER_MODEL__}}"
 # First-wins order matches runner: MIDKERNEL_OPENROUTER_MAX_TOKENS,
 # OPENROUTER_MAX_TOKENS, KIMI_MAX_TOKENS, KIMI_MODEL_MAX_TOKENS,
 # KIMI_MODEL_MAX_COMPLETION_TOKENS.
@@ -560,6 +562,7 @@ def prepare_script(slug: str) -> str:
     return (
         PREPARE_SCRIPT_TEMPLATE.replace("__PLAYBOOK_SLUG__", slug)
         .replace("__DEFAULT_CLONE__", default_clone)
+        .replace("__DEFAULT_OPENROUTER_MODEL__", DEFAULT_OPENROUTER_MODEL)
         .replace("__KIMI_MAX_TOKENS__", str(kimi_max_tokens()))
         .strip()
     )
