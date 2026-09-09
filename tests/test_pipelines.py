@@ -45,6 +45,15 @@ def _load(slug: str, env: dict[str, str] | None = None) -> dict:
     merged.pop("MIDKERNEL_AGENTFLOW_TARGET", None)
     merged.pop("RUN_ID", None)
     merged["MIDKERNEL_NODE_IO"] = "0"
+    for name in (
+        "KIMI_MAX_TOKENS",
+        "OPENROUTER_MAX_TOKENS",
+        "MIDKERNEL_OPENROUTER_MAX_TOKENS",
+        "KIMI_MODEL_MAX_COMPLETION_TOKENS",
+        "KIMI_MODEL_MAX_TOKENS",
+    ):
+        if not env or name not in env:
+            merged.pop(name, None)
     if env:
         merged.update(env)
     result = subprocess.run(
@@ -79,6 +88,10 @@ def test_security_review_graph_is_kimi_openrouter_on_midkernel_ecs() -> None:
     assert review["env"]["MIDKERNEL_NODE_ID"] == "review"
     assert review["env"]["OPENAI_BASE_URL"] == "https://openrouter.ai/api/v1"
     assert review["env"]["KIMI_SHARE_DIR"].endswith(".midkernel/kimi")
+    assert review["env"]["KIMI_MAX_TOKENS"] == "32768"
+    assert review["env"]["OPENROUTER_MAX_TOKENS"] == "32768"
+    assert review["env"]["MIDKERNEL_OPENROUTER_MAX_TOKENS"] == "32768"
+    assert review["env"]["KIMI_MODEL_MAX_COMPLETION_TOKENS"] == "32768"
     assert review["extra_args"][0] == "--config"
     assert review["extra_args"][1].endswith("config.toml")
     assert "\n" not in review["extra_args"][1]
@@ -197,6 +210,9 @@ def test_goal_security_review_graph_nodes_and_openrouter_lock() -> None:
         assert node["tools"] == "read_write"
         assert node["target"]["kind"] == "ecs"
         assert node["target"]["cluster"] == "midkernel-dev"
+        assert node["env"]["KIMI_MAX_TOKENS"] == "32768"
+        assert node["env"]["OPENROUTER_MAX_TOKENS"] == "32768"
+        assert node["env"]["MIDKERNEL_OPENROUTER_MAX_TOKENS"] == "32768"
 
     for index in range(1, 7):
         hunter = nodes[f"hunter-{index}"]
@@ -208,6 +224,9 @@ def test_goal_security_review_graph_nodes_and_openrouter_lock() -> None:
         assert hunter["env"]["BASH_ENV"] == "/dev/null"
         assert hunter["env"]["OPENAI_BASE_URL"] == "https://openrouter.ai/api/v1"
         assert hunter["env"]["KIMI_SHARE_DIR"].endswith(".midkernel/kimi")
+        assert hunter["env"]["KIMI_MAX_TOKENS"] == "32768"
+        assert hunter["env"]["OPENROUTER_MAX_TOKENS"] == "32768"
+        assert hunter["env"]["MIDKERNEL_OPENROUTER_MAX_TOKENS"] == "32768"
         assert hunter["extra_args"][0] == "--config"
         assert hunter["extra_args"][1].endswith("config.toml")
         assert "\n" not in hunter["extra_args"][1]
@@ -276,3 +295,51 @@ def test_goal_security_review_judge_models_follow_env() -> None:
     nodes = {node["id"]: node for node in spec["nodes"]}
     assert nodes["judge-a"]["model"] == "openai/gpt-4o"
     assert nodes["judge-b"]["model"] == "google/gemini-2.5-pro"
+
+
+def test_goal_security_review_max_tokens_env_override() -> None:
+    spec = _load(GOAL_SLUG, env={"KIMI_MAX_TOKENS": "65536"})
+    nodes = {node["id"]: node for node in spec["nodes"]}
+    for task_id in (
+        "threat-model",
+        "goal-author",
+        "surface-split",
+        "hunter-1",
+        "judge-a",
+        "judge-b",
+        "assemble",
+    ):
+        assert nodes[task_id]["env"]["KIMI_MAX_TOKENS"] == "65536"
+        assert nodes[task_id]["env"]["OPENROUTER_MAX_TOKENS"] == "65536"
+        assert nodes[task_id]["env"]["MIDKERNEL_OPENROUTER_MAX_TOKENS"] == "65536"
+
+
+def test_goal_security_review_rejects_131072_opt_in() -> None:
+    spec = _load(GOAL_SLUG, env={"KIMI_MAX_TOKENS": "131072"})
+    nodes = {node["id"]: node for node in spec["nodes"]}
+    for task_id in ("threat-model", "hunter-1", "assemble"):
+        assert nodes[task_id]["env"]["KIMI_MAX_TOKENS"] == "32768"
+        assert nodes[task_id]["env"]["OPENROUTER_MAX_TOKENS"] == "32768"
+        assert nodes[task_id]["env"]["MIDKERNEL_OPENROUTER_MAX_TOKENS"] == "32768"
+
+
+def test_goal_security_review_midkernel_alias_override() -> None:
+    spec = _load(GOAL_SLUG, env={"MIDKERNEL_OPENROUTER_MAX_TOKENS": "65536"})
+    nodes = {node["id"]: node for node in spec["nodes"]}
+    assert nodes["hunter-1"]["env"]["KIMI_MAX_TOKENS"] == "65536"
+    assert nodes["hunter-1"]["env"]["MIDKERNEL_OPENROUTER_MAX_TOKENS"] == "65536"
+
+
+def test_goal_security_review_env_first_wins_midkernel_over_kimi() -> None:
+    spec = _load(
+        GOAL_SLUG,
+        env={
+            "KIMI_MAX_TOKENS": "4096",
+            "OPENROUTER_MAX_TOKENS": "8192",
+            "MIDKERNEL_OPENROUTER_MAX_TOKENS": "65536",
+        },
+    )
+    nodes = {node["id"]: node for node in spec["nodes"]}
+    assert nodes["hunter-1"]["env"]["KIMI_MAX_TOKENS"] == "65536"
+    assert nodes["hunter-1"]["env"]["OPENROUTER_MAX_TOKENS"] == "65536"
+    assert nodes["hunter-1"]["env"]["MIDKERNEL_OPENROUTER_MAX_TOKENS"] == "65536"

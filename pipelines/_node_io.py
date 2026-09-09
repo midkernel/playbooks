@@ -34,15 +34,19 @@ from __future__ import annotations
 import argparse
 import base64
 import fcntl
+import http.client
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import threading
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 ARTIFACTS_BUCKET = "midkernel-dev-artifacts"
 ARTIFACTS_PREFIX = "runs/"
@@ -55,6 +59,20 @@ KIMI_PROBE_FLAGS = {"--version", "-V", "--help", "-h"}
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_OPENROUTER_MODEL = "moonshotai/kimi-k3"
 OPENROUTER_KEY_PLACEHOLDER = "OVERRIDE_VIA_ENV"
+# Safe per-request generation cap. kimi.bin / OpenRouter otherwise reserve the
+# model catalog (or remaining-context) default of 131072, which 402s typical
+# keys as in_flight_budget_exhausted (run cmtufzqzo0003k004mt2w0m9c).
+DEFAULT_KIMI_MAX_TOKENS = 32768
+MAX_SAFE_KIMI_MAX_TOKENS = 65536
+UNSAFE_OPENROUTER_MAX_TOKENS = 131072
+# First-wins order matches midkernel/runner (runner#8).
+MAX_TOKENS_ENV_NAMES = (
+    "MIDKERNEL_OPENROUTER_MAX_TOKENS",
+    "OPENROUTER_MAX_TOKENS",
+    "KIMI_MAX_TOKENS",
+    "KIMI_MODEL_MAX_TOKENS",
+    "KIMI_MODEL_MAX_COMPLETION_TOKENS",
+)
 NODE_STATUSES = ("pending", "running", "completed", "failed")
 SAFE_NODE_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 SAFE_RUN_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
@@ -78,6 +96,276 @@ def env_first(*names: str, default: str = "") -> str:
         if value:
             return value
     return default
+
+
+def clamp_kimi_max_tokens(value: int) -> int:
+    """Wallet-safe completion cap. Hard ceiling 65536; 131072 is never opt-in.
+
+    ``131072`` is the exact OpenRouter reservation that 402s typical keys
+    (run ``cmtufzqzo0003k004mt2w0m9c``). Values ``>= 131072`` or otherwise
+    above ``65536`` fall back to the ``32768`` default — they do not become
+    a valid override. Config writers stay in lockstep with runner#8
+    (``max_tokens = 32768`` next to ``max_context_size``).
+    """
+    if value <= 0:
+        return DEFAULT_KIMI_MAX_TOKENS
+    if value >= UNSAFE_OPENROUTER_MAX_TOKENS:
+        return DEFAULT_KIMI_MAX_TOKENS
+    if value > MAX_SAFE_KIMI_MAX_TOKENS:
+        return DEFAULT_KIMI_MAX_TOKENS
+    return value
+
+
+class OpenRouterMaxTokensCapError(ValueError):
+    """chat/completions cannot be forwarded without a clamped ``max_tokens``."""
+
+
+def kimi_max_tokens() -> int:
+    """Per-request OpenRouter ``max_tokens`` for every Kimi node.
+
+    Default ``32768``. Hard ceiling ``65536``. First-wins env order matches
+    runner: ``MIDKERNEL_OPENROUTER_MAX_TOKENS``, ``OPENROUTER_MAX_TOKENS``,
+    ``KIMI_MAX_TOKENS``, ``KIMI_MODEL_MAX_TOKENS``,
+    ``KIMI_MODEL_MAX_COMPLETION_TOKENS``. ``0`` / negative are ignored —
+    kimi-cli treats those as “disable clamp”, which restores the 131072
+    reservation that 402s typical keys. ``131072`` is **not** a valid opt-in
+    (that is the exact 402 reservation).
+    """
+    raw = env_first(*MAX_TOKENS_ENV_NAMES, default=str(DEFAULT_KIMI_MAX_TOKENS))
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_KIMI_MAX_TOKENS
+    return clamp_kimi_max_tokens(value)
+
+
+def max_tokens_env(cap: int | None = None) -> dict[str, str]:
+    """Bake the generation cap onto every Kimi node / wrap child env."""
+    n = str(clamp_kimi_max_tokens(kimi_max_tokens() if cap is None else int(cap)))
+    return {name: n for name in MAX_TOKENS_ENV_NAMES}
+
+
+def cap_openrouter_payload(payload: dict[str, Any], cap: int) -> dict[str, Any]:
+    """Force an explicit generation limit onto a chat/completions body.
+
+    OpenRouter reserves ``max_tokens`` against in-flight budget. Omitting it
+    (or sending 131072) is the 402. Always set ``max_tokens``; also clamp
+    ``max_completion_tokens`` when present. The cap itself is clamped so a
+    caller cannot opt in to the 131072 reservation.
+    """
+    cap = clamp_kimi_max_tokens(int(cap))
+    out = dict(payload)
+    for key in ("max_tokens", "max_completion_tokens"):
+        if key not in out:
+            continue
+        try:
+            current = int(out[key])
+        except (TypeError, ValueError):
+            out[key] = cap
+            continue
+        if current <= 0 or current > cap:
+            out[key] = cap
+    if "max_tokens" not in out:
+        out["max_tokens"] = cap
+    return out
+
+
+def cap_openrouter_request_body(raw: bytes, cap: int) -> bytes:
+    """Return JSON that always includes a clamped ``max_tokens``.
+
+    Empty / whitespace-only body → inject ``{"max_tokens": cap}``.
+    Valid JSON object → parse and set / clamp ``max_tokens``.
+    Non-JSON or non-object → raise (never pass the original body through).
+    """
+    cap = clamp_kimi_max_tokens(int(cap))
+    if not raw or not raw.strip():
+        return json.dumps({"max_tokens": cap}, ensure_ascii=False).encode("utf-8")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise OpenRouterMaxTokensCapError(
+            "chat/completions body is not JSON; refusing to forward without max_tokens"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise OpenRouterMaxTokensCapError(
+            "chat/completions body is not a JSON object; refusing to forward without max_tokens"
+        )
+    return json.dumps(cap_openrouter_payload(payload, cap), ensure_ascii=False).encode("utf-8")
+
+
+def read_http_request_body(headers: Any, rfile: Any) -> bytes:
+    """Read a request body. Missing Content-Length is empty, not pass-through."""
+    length_raw = headers.get("Content-Length") if headers is not None else None
+    if length_raw is not None and str(length_raw).strip() != "":
+        try:
+            length = int(length_raw)
+        except (TypeError, ValueError):
+            return b""
+        if length <= 0:
+            return b""
+        return rfile.read(length) or b""
+    encoding = ""
+    if headers is not None:
+        encoding = (headers.get("Transfer-Encoding") or "").lower()
+    if "chunked" in encoding:
+        return _read_chunked_body(rfile)
+    return b""
+
+
+def _read_chunked_body(rfile: Any) -> bytes:
+    chunks: list[bytes] = []
+    while True:
+        line = rfile.readline()
+        if not line:
+            break
+        size_token = line.split(b";", 1)[0].strip()
+        try:
+            size = int(size_token, 16)
+        except ValueError:
+            break
+        if size == 0:
+            while True:
+                trailer = rfile.readline()
+                if not trailer or trailer in {b"\r\n", b"\n"}:
+                    break
+            break
+        chunks.append(rfile.read(size) or b"")
+        rfile.read(2)  # CRLF after chunk
+    return b"".join(chunks)
+
+
+def resolve_upstream_request(upstream_base: str, incoming_path: str) -> tuple[str, str, int, str]:
+    """Map a proxy request onto the real OpenRouter (or test) upstream."""
+    parts = urlsplit(upstream_base or OPENROUTER_BASE_URL)
+    scheme = parts.scheme or "https"
+    host = parts.hostname or "openrouter.ai"
+    port = parts.port or (443 if scheme == "https" else 80)
+    incoming = incoming_path or "/"
+    query = ""
+    if "?" in incoming:
+        incoming, query = incoming.split("?", 1)
+        query = "?" + query
+    base_path = (parts.path or "").rstrip("/")
+    if incoming.startswith("/api/") or (base_path and incoming.startswith(base_path)):
+        path = incoming
+    elif incoming.startswith("/v1/"):
+        prefix = base_path[: -len("/v1")] if base_path.endswith("/v1") else "/api"
+        path = f"{prefix}{incoming}"
+    else:
+        path = f"{base_path or '/api/v1'}{incoming if incoming.startswith('/') else '/' + incoming}"
+    return scheme, host, port, path + query
+
+
+_HOP_BY_HOP = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+    "host",
+    "content-length",
+}
+
+
+def _is_chat_completions_path(path: str) -> bool:
+    return "chat/completions" in (path or "").split("?", 1)[0]
+
+
+class OpenRouterMaxTokensProxy:
+    """Local reverse proxy that injects ``max_tokens`` on OpenRouter calls.
+
+    kimi-cli ``openai_legacy`` (OpenRouter) does **not** honor
+    ``KIMI_MODEL_MAX_COMPLETION_TOKENS`` or ``max_output_size`` — those apply
+    to the native Kimi / Anthropic providers. The 402 is on the HTTP body
+    OpenRouter actually receives, so wrap_kimi must clamp that body.
+    """
+
+    def __init__(self, cap: int, *, upstream_base: str = OPENROUTER_BASE_URL) -> None:
+        self.cap = clamp_kimi_max_tokens(int(cap))
+        self.upstream_base = upstream_base.rstrip("/")
+        self._server: ThreadingHTTPServer | None = None
+        self._thread: threading.Thread | None = None
+
+    @property
+    def base_url(self) -> str:
+        if self._server is None:
+            raise RuntimeError("OpenRouter max_tokens proxy is not started")
+        _host, port = self._server.server_address
+        return f"http://127.0.0.1:{int(port)}/api/v1"
+
+    def start(self) -> str:
+        proxy = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, fmt: str, *args: object) -> None:
+                return
+
+            def _forward(self) -> None:
+                incoming = self.path or "/"
+                raw = read_http_request_body(self.headers, self.rfile)
+                if _is_chat_completions_path(incoming):
+                    try:
+                        raw = cap_openrouter_request_body(raw, proxy.cap)
+                    except OpenRouterMaxTokensCapError as exc:
+                        self.send_error(400, str(exc))
+                        return
+                scheme, host, port, path = resolve_upstream_request(proxy.upstream_base, incoming)
+                headers = {
+                    key: value
+                    for key, value in self.headers.items()
+                    if key.lower() not in _HOP_BY_HOP
+                }
+                headers["Host"] = host
+                headers["Content-Length"] = str(len(raw))
+                conn: http.client.HTTPConnection
+                if scheme == "https":
+                    conn = http.client.HTTPSConnection(host, port, timeout=600)
+                else:
+                    conn = http.client.HTTPConnection(host, port, timeout=600)
+                try:
+                    conn.request(self.command, path, body=raw if raw else None, headers=headers)
+                    upstream = conn.getresponse()
+                    self.send_response(upstream.status)
+                    for key, value in upstream.getheaders():
+                        if key.lower() in {"transfer-encoding", "connection", "keep-alive"}:
+                            continue
+                        self.send_header(key, value)
+                    self.end_headers()
+                    while True:
+                        chunk = upstream.read(65536)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                finally:
+                    conn.close()
+
+            def do_GET(self) -> None:  # noqa: N802
+                self._forward()
+
+            def do_POST(self) -> None:  # noqa: N802
+                self._forward()
+
+            def do_PUT(self) -> None:  # noqa: N802
+                self._forward()
+
+            def do_DELETE(self) -> None:  # noqa: N802
+                self._forward()
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True, name="or-max-tokens")
+        self._thread.start()
+        return self.base_url
+
+    def stop(self) -> None:
+        if self._server is None:
+            return
+        self._server.shutdown()
+        self._server.server_close()
+        self._server = None
+        self._thread = None
 
 
 def workdir() -> str:
@@ -891,12 +1179,20 @@ def resolve_openrouter_api_key() -> str:
     return ""
 
 
-def render_kimi_openrouter_config(model: str | None = None, *, api_key: str | None = None) -> str:
+def render_kimi_openrouter_config(
+    model: str | None = None,
+    *,
+    api_key: str | None = None,
+    max_tokens: int | None = None,
+    base_url: str | None = None,
+) -> str:
     slug = normalize_openrouter_slug(
         model or env_first("MIDKERNEL_NODE_MODEL", "OPENROUTER_MODEL", "MODEL"),
         default=DEFAULT_OPENROUTER_MODEL,
     )
     key = (api_key if api_key is not None else resolve_openrouter_api_key()) or OPENROUTER_KEY_PLACEHOLDER
+    cap = clamp_kimi_max_tokens(kimi_max_tokens() if max_tokens is None else int(max_tokens))
+    url = (base_url or OPENROUTER_BASE_URL).rstrip("/")
     return "\n".join(
         [
             'default_model = "midkernel"',
@@ -905,23 +1201,39 @@ def render_kimi_openrouter_config(model: str | None = None, *, api_key: str | No
             "",
             "[providers.openrouter]",
             'type = "openai_legacy"',
-            f'base_url = "{OPENROUTER_BASE_URL}"',
+            f'base_url = "{url}"',
             f'api_key = "{key}"',
             "",
             "[models.midkernel]",
             'provider = "openrouter"',
             f'model = "{slug}"',
             "max_context_size = 262144",
+            # Completion budget only. Never copy max_context_size here —
+            # OpenRouter 402 in_flight_budget_exhausted on 131072
+            # (GOAL cmtufzqzo0003k004mt2w0m9c). Lockstep with runner#8.
+            f"max_tokens = {cap}",
+            f"max_output_size = {cap}",
             "",
         ]
     )
 
 
-def write_kimi_openrouter_config(model: str | None = None, *, api_key: str | None = None) -> Path:
+def write_kimi_openrouter_config(
+    model: str | None = None,
+    *,
+    api_key: str | None = None,
+    max_tokens: int | None = None,
+    base_url: str | None = None,
+) -> Path:
     """Write OpenRouter config where kimi.bin will find it after BASH_ENV skip."""
     path = kimi_config_file()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(render_kimi_openrouter_config(model, api_key=api_key), encoding="utf-8")
+    path.write_text(
+        render_kimi_openrouter_config(
+            model, api_key=api_key, max_tokens=max_tokens, base_url=base_url
+        ),
+        encoding="utf-8",
+    )
     try:
         path.chmod(0o600)
     except OSError:
@@ -984,6 +1296,7 @@ def openrouter_passthrough_env(*, model: str | None = None) -> dict[str, str]:
         "KIMI_SHARE_DIR": str(kimi_share_dir()),
         "WORKDIR": workdir(),
     }
+    env.update(max_tokens_env())
     key = resolve_openrouter_api_key()
     if key:
         env["OPENROUTER_API_KEY"] = key
@@ -1296,11 +1609,27 @@ def wrap_kimi(argv: list[str]) -> int:
         child_env["OPENAI_API_KEY"] = key
         child_env["KIMI_API_KEY"] = key
         child_env["MOONSHOT_API_KEY"] = key
+    cap = kimi_max_tokens()
+    child_env.update(max_tokens_env(cap))
     child_env["KIMI_SHARE_DIR"] = str(config_path.parent)
+    proxy: OpenRouterMaxTokensProxy | None = None
+    try:
+        proxy = OpenRouterMaxTokensProxy(cap)
+        proxy_url = proxy.start()
+        child_env["OPENAI_BASE_URL"] = proxy_url
+        write_kimi_openrouter_config(model, api_key=key or None, max_tokens=cap, base_url=proxy_url)
+    except Exception as exc:  # noqa: BLE001
+        if proxy is not None:
+            proxy.stop()
+        error = f"max_tokens proxy failed: {exc}"
+        print(f"node io: {error}", file=sys.stderr)
+        finish_node(node_id, status="failed", error=error, outputs=parse_outputs(None))
+        return 1
     print(
         f"node io: kimi OpenRouter config={config_path} "
         f"model={child_env.get('OPENROUTER_MODEL', '')} "
-        f"key_set={'yes' if key else 'no'} bin={binary}",
+        f"key_set={'yes' if key else 'no'} max_tokens={cap} "
+        f"proxy={proxy_url} bin={binary}",
         file=sys.stderr,
     )
     command = [binary, *argv]
@@ -1312,10 +1641,14 @@ def wrap_kimi(argv: list[str]) -> int:
         code = 1
         error = str(exc)
         print(f"node io: kimi wrapper failed ({binary}): {exc}", file=sys.stderr)
+    finally:
+        proxy.stop()
     status = "completed" if code == 0 else "failed"
     if code != 0 and not error:
         error = f"exit {code}"
-    finish_node(node_id, status=status, error=error)
+    # Upload files the model actually wrote (RESULT.md / report.md / …).
+    # Never invent hunter findings or a stub RESULT.md on 402 / empty return.
+    finish_node(node_id, status=status, error=error, outputs=parse_outputs(None))
     return code
 
 
