@@ -15,16 +15,22 @@ from typing import Any
 try:
     from ._node_io import (  # type: ignore[import-not-found]
         bootstrap_run_io,
+        kimi_config_file,
         kimi_executable,
         kimi_io_env,
+        openrouter_passthrough_env,
+        render_kimi_openrouter_config,
         shell_io_env,
         wrap_shell_script,
     )
 except ImportError:  # ``python3 pipelines/<slug>.py`` puts this dir on sys.path
     from _node_io import (  # type: ignore[import-not-found]
         bootstrap_run_io,
+        kimi_config_file,
         kimi_executable,
         kimi_io_env,
+        openrouter_passthrough_env,
+        render_kimi_openrouter_config,
         shell_io_env,
         wrap_shell_script,
     )
@@ -278,38 +284,27 @@ def openrouter_provider() -> dict[str, Any]:
     }
 
 
-def openrouter_node_env() -> dict[str, str]:
-    key = env_first("OPENROUTER_API_KEY", "OPENAI_API_KEY")
-    env = {
-        "OPENAI_BASE_URL": OPENROUTER_BASE_URL,
-    }
-    if key:
-        env["OPENROUTER_API_KEY"] = key
-        env["OPENAI_API_KEY"] = key
-        env["KIMI_API_KEY"] = key
-    return env
+def openrouter_node_env(*, model: str | None = None) -> dict[str, str]:
+    """OpenRouter env baked onto every Kimi node (review + emit_goal).
+
+    ``BASH_ENV=/dev/null`` skips runner ``prepare_node``, so keys / HOME /
+    ``KIMI_SHARE_DIR`` must live on the node env, not only the parent process.
+    """
+    return openrouter_passthrough_env(model=model or openrouter_model())
 
 
 def kimi_openrouter_config(model: str | None = None) -> str:
-    slug = model or openrouter_model()
-    return "\n".join(
-        [
-            "default_model = \"midkernel\"",
-            "default_thinking = false",
-            "default_yolo = true",
-            "",
-            "[providers.openrouter]",
-            "type = \"openai_legacy\"",
-            f"base_url = \"{OPENROUTER_BASE_URL}\"",
-            "api_key = \"OVERRIDE_VIA_ENV\"",
-            "",
-            "[models.midkernel]",
-            "provider = \"openrouter\"",
-            f"model = \"{slug}\"",
-            "max_context_size = 262144",
-            "",
-        ]
-    )
+    return render_kimi_openrouter_config(model or openrouter_model())
+
+
+def kimi_extra_args(model: str | None = None) -> list[str]:
+    """``--config`` must be a file path. agentflow appends extra_args verbatim.
+
+    Inline TOML (the old value) made kimi.bin print ``LLM not set`` on
+    review / threat-model after prepare succeeded.
+    """
+    del model  # path is shared; wrap_kimi rewrites the file per-node model
+    return ["--config", str(kimi_config_file())]
 
 
 def default_target(slug: str) -> DefaultTarget | None:
@@ -385,10 +380,11 @@ esac
 
 export WORKDIR
 export OUTPUTS_DIR
-mkdir -p "$WORKDIR" "$OUTPUTS_DIR" "$HOME/.kimi" "$WORKDIR/.midkernel"
+mkdir -p "$WORKDIR" "$OUTPUTS_DIR" "$HOME/.kimi" "$WORKDIR/.midkernel" "$WORKDIR/.midkernel/kimi"
 export MIDKERNEL_NODE_IO="${MIDKERNEL_NODE_IO:-1}"
 export BASH_ENV=/dev/null
 export MIDKERNEL_NODE_READY=1
+export KIMI_SHARE_DIR="${KIMI_SHARE_DIR:-$WORKDIR/.midkernel/kimi}"
 if [ -x /opt/midkernel/kimi.bin ]; then
   export MIDKERNEL_KIMI_BIN="${MIDKERNEL_KIMI_BIN:-/opt/midkernel/kimi.bin}"
   export KIMI_REAL_BIN="${KIMI_REAL_BIN:-$MIDKERNEL_KIMI_BIN}"
@@ -429,16 +425,25 @@ def load_secret(secret_id: str, region: str) -> str:
     return raw
 
 secret_id, gh_secret_id, region = sys.argv[1], sys.argv[2], sys.argv[3]
+workdir = os.environ.get("WORKDIR", "/workspace")
 if not os.environ.get("OPENROUTER_API_KEY", "").strip() and os.environ.get("MIDKERNEL_LOCAL") != "1":
     value = load_secret(secret_id, region)
     if value:
-        print(value, file=open(os.environ["HOME"] + "/.midkernel-openrouter", "w"))
+        for dest in (
+            os.path.join(os.environ.get("HOME", "/home/agent"), ".midkernel-openrouter"),
+            os.path.join(workdir, ".midkernel-openrouter"),
+        ):
+            print(value, file=open(dest, "w"))
 if not os.environ.get("GITHUB_TOKEN", "").strip() and os.environ.get("MIDKERNEL_LOCAL") != "1":
     value = load_secret(gh_secret_id, region)
     if value:
         print(value, file=open(os.environ["HOME"] + "/.midkernel-github", "w"))
 PY
 
+if [ -z "${OPENROUTER_API_KEY:-}" ] && [ -f "$WORKDIR/.midkernel-openrouter" ]; then
+  OPENROUTER_API_KEY="$(tr -d '\n' < "$WORKDIR/.midkernel-openrouter")"
+  export OPENROUTER_API_KEY
+fi
 if [ -z "${OPENROUTER_API_KEY:-}" ] && [ -f "$HOME/.midkernel-openrouter" ]; then
   OPENROUTER_API_KEY="$(tr -d '\n' < "$HOME/.midkernel-openrouter")"
   export OPENROUTER_API_KEY
@@ -456,7 +461,17 @@ export OPENAI_API_KEY="$OPENROUTER_API_KEY"
 export KIMI_API_KEY="$OPENROUTER_API_KEY"
 export OPENAI_BASE_URL="https://openrouter.ai/api/v1"
 
-cat > "$HOME/.kimi/config.toml" <<EOF
+# Persist key + config on the shared task disk. Later Kimi nodes run with
+# cwd=$WORKDIR/repo and BASH_ENV=/dev/null (runner prepare_node skipped),
+# so $HOME/.kimi/config.toml alone is not enough.
+printf '%s' "$OPENROUTER_API_KEY" > "$WORKDIR/.midkernel-openrouter"
+chmod 600 "$WORKDIR/.midkernel-openrouter" || true
+if [ -n "${HOME:-}" ]; then
+  printf '%s' "$OPENROUTER_API_KEY" > "$HOME/.midkernel-openrouter"
+  chmod 600 "$HOME/.midkernel-openrouter" || true
+fi
+
+cat > "$KIMI_SHARE_DIR/config.toml" <<EOF
 default_model = "midkernel"
 default_thinking = false
 default_yolo = true
@@ -464,13 +479,16 @@ default_yolo = true
 [providers.openrouter]
 type = "openai_legacy"
 base_url = "https://openrouter.ai/api/v1"
-api_key = "OVERRIDE_VIA_ENV"
+api_key = "${OPENROUTER_API_KEY}"
 
 [models.midkernel]
 provider = "openrouter"
 model = "${OPENROUTER_MODEL}"
 max_context_size = 262144
 EOF
+chmod 600 "$KIMI_SHARE_DIR/config.toml" || true
+cp "$KIMI_SHARE_DIR/config.toml" "$HOME/.kimi/config.toml"
+chmod 600 "$HOME/.kimi/config.toml" || true
 
 if [ ! -d "$REPO_DIR/.git" ]; then
   if [ -z "${GITHUB_TOKEN:-}" ]; then
@@ -541,9 +559,9 @@ def build_scan_graph(slug: str, *, description: str):
             model=model,
             tools="read_write",
             provider=openrouter_provider(),
-            env={**openrouter_node_env(), **kimi_io_env("review", outputs=[REPORT_NAME], model=model)},
+            env={**openrouter_node_env(model=model), **kimi_io_env("review", outputs=[REPORT_NAME], model=model)},
             executable=kimi_executable(),
-            extra_args=["--config", kimi_openrouter_config(model)],
+            extra_args=kimi_extra_args(model),
             timeout_seconds=timeout,
             retries=0,
             target=node_target(cwd=review_cwd),
@@ -635,7 +653,7 @@ def _kimi_scan_node(
     from agentflow import kimi
 
     slug = model or openrouter_model()
-    env = openrouter_node_env()
+    env = openrouter_node_env(model=slug)
     env.update(
         kimi_io_env(
             task_id,
@@ -653,7 +671,7 @@ def _kimi_scan_node(
         "provider": openrouter_provider(),
         "env": env,
         "executable": kimi_executable(),
-        "extra_args": ["--config", kimi_openrouter_config(slug)],
+        "extra_args": kimi_extra_args(slug),
         "timeout_seconds": timeout_seconds or PROFILE_TIMEOUT_SECONDS[scan_profile()],
         "retries": 0,
         "target": node_target(cwd=cwd),

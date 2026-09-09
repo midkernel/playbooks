@@ -56,6 +56,26 @@ def test_kimi_config_is_openrouter_legacy() -> None:
     assert "bedrock" not in config.lower()
 
 
+def test_kimi_extra_args_is_config_file_path() -> None:
+    args = mk.kimi_extra_args("moonshotai/kimi-k3")
+    assert args[0] == "--config"
+    assert args[1].endswith(".midkernel/kimi/config.toml")
+    assert "\n" not in args[1]
+    assert "default_model" not in args[1]
+
+
+def test_openrouter_node_env_passthrough(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("WORKDIR", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path / "agent"))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-emit")
+    env = mk.openrouter_node_env(model="moonshotai/kimi-k3")
+    assert env["OPENROUTER_API_KEY"] == "sk-or-emit"
+    assert env["OPENAI_API_KEY"] == "sk-or-emit"
+    assert env["OPENAI_BASE_URL"] == mk.OPENROUTER_BASE_URL
+    assert env["HOME"] == str(tmp_path / "agent")
+    assert env["KIMI_SHARE_DIR"] == str(tmp_path / ".midkernel" / "kimi")
+
+
 def test_target_mode_local(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MIDKERNEL_AGENTFLOW_TARGET", "local")
     target = mk.node_target(cwd="/workspace/repo")
@@ -84,6 +104,9 @@ def test_prepare_script_bakes_playbook_defaults() -> None:
     assert 'export MIDKERNEL_NODE_IO="${MIDKERNEL_NODE_IO:-1}"' in security
     assert "export WORKDIR" in security
     assert "node io: prepare WORKDIR=" in security
+    assert "KIMI_SHARE_DIR" in security
+    assert "$KIMI_SHARE_DIR/config.toml" in security
+    assert "$WORKDIR/.midkernel-openrouter" in security
 
     solana = mk.prepare_script("solana-validator-security")
     assert "PLAYBOOK_SLUG:-solana-validator-security" in solana

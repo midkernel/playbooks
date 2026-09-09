@@ -52,6 +52,9 @@ DEFAULT_GOAL_COUNT = 6
 MAX_GOAL_HUNTERS = 6
 IMAGE_KIMI_BIN = "/opt/midkernel/kimi.bin"
 KIMI_PROBE_FLAGS = {"--version", "-V", "--help", "-h"}
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+DEFAULT_OPENROUTER_MODEL = "moonshotai/kimi-k3"
+OPENROUTER_KEY_PLACEHOLDER = "OVERRIDE_VIA_ENV"
 NODE_STATUSES = ("pending", "running", "completed", "failed")
 SAFE_NODE_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 SAFE_RUN_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
@@ -847,12 +850,162 @@ def is_report_md_wrapper(path: str | Path) -> bool:
     return "midkernel-publish-report" in text or "KIMI_REAL_BIN" in text
 
 
+def kimi_share_dir() -> Path:
+    """cwd-stable Kimi config dir (review/threat-model cwd is ``$WORKDIR/repo``)."""
+    override = env_first("KIMI_SHARE_DIR")
+    if override:
+        return Path(override)
+    return Path(workdir()) / ".midkernel" / "kimi"
+
+
+def kimi_config_file() -> Path:
+    return kimi_share_dir() / "config.toml"
+
+
+def normalize_openrouter_slug(raw: str | None, *, default: str = DEFAULT_OPENROUTER_MODEL) -> str:
+    slug = (raw or "").strip()
+    if slug.startswith("openrouter/"):
+        slug = slug[len("openrouter/") :]
+    if "/" not in slug:
+        return default
+    return slug
+
+
+def resolve_openrouter_api_key() -> str:
+    """Emit-time env, then files prepare/runner write (HOME or WORKDIR)."""
+    key = env_first("OPENROUTER_API_KEY", "OPENAI_API_KEY", "KIMI_API_KEY")
+    if key:
+        return key
+    home = env_first("HOME")
+    candidates = []
+    if home:
+        candidates.append(Path(home) / ".midkernel-openrouter")
+    candidates.append(Path(workdir()) / ".midkernel-openrouter")
+    for path in candidates:
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if text:
+            return text
+    return ""
+
+
+def render_kimi_openrouter_config(model: str | None = None, *, api_key: str | None = None) -> str:
+    slug = normalize_openrouter_slug(
+        model or env_first("MIDKERNEL_NODE_MODEL", "OPENROUTER_MODEL", "MODEL"),
+        default=DEFAULT_OPENROUTER_MODEL,
+    )
+    key = (api_key if api_key is not None else resolve_openrouter_api_key()) or OPENROUTER_KEY_PLACEHOLDER
+    return "\n".join(
+        [
+            'default_model = "midkernel"',
+            "default_thinking = false",
+            "default_yolo = true",
+            "",
+            "[providers.openrouter]",
+            'type = "openai_legacy"',
+            f'base_url = "{OPENROUTER_BASE_URL}"',
+            f'api_key = "{key}"',
+            "",
+            "[models.midkernel]",
+            'provider = "openrouter"',
+            f'model = "{slug}"',
+            "max_context_size = 262144",
+            "",
+        ]
+    )
+
+
+def write_kimi_openrouter_config(model: str | None = None, *, api_key: str | None = None) -> Path:
+    """Write OpenRouter config where kimi.bin will find it after BASH_ENV skip."""
+    path = kimi_config_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(render_kimi_openrouter_config(model, api_key=api_key), encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+    home = env_first("HOME")
+    if home:
+        home_cfg = Path(home) / ".kimi" / "config.toml"
+        try:
+            home_cfg.parent.mkdir(parents=True, exist_ok=True)
+            if home_cfg.resolve() != path.resolve():
+                home_cfg.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+                home_cfg.chmod(0o600)
+        except OSError:
+            pass
+    return path
+
+
+def is_kimi_config_path(value: str) -> bool:
+    """True when ``--config`` is a filesystem path, not inline TOML."""
+    text = (value or "").strip()
+    if not text or "\n" in text or text.startswith("default_model"):
+        return False
+    try:
+        return Path(text).is_file()
+    except OSError:
+        return False
+
+
+def ensure_kimi_config_argv(argv: list[str], *, model: str | None = None) -> tuple[list[str], Path]:
+    """agentflow appends ``extra_args``; ``--config`` must be a real file path."""
+    path = write_kimi_openrouter_config(model)
+    out = list(argv)
+    if "--config" in out:
+        index = out.index("--config")
+        if index + 1 < len(out) and is_kimi_config_path(out[index + 1]):
+            return out, Path(out[index + 1])
+        if index + 1 < len(out):
+            out[index + 1] = str(path)
+        else:
+            out.append(str(path))
+    else:
+        out.extend(["--config", str(path)])
+    return out, path
+
+
+def openrouter_passthrough_env(*, model: str | None = None) -> dict[str, str]:
+    """Env kimi.bin needs when runner ``prepare_node`` is skipped (BASH_ENV=/dev/null).
+
+    Agentflow ``KimiAdapter`` merges only provider.env + node.env (not a fresh
+    isolated env), then LocalRunner overlays that on ``os.environ``. Still put
+    OpenRouter keys on the node so emit_goal hunters/threat-model match review.
+    """
+    slug = normalize_openrouter_slug(
+        model or env_first("MIDKERNEL_NODE_MODEL", "OPENROUTER_MODEL", "MODEL"),
+        default=DEFAULT_OPENROUTER_MODEL,
+    )
+    env = {
+        "OPENAI_BASE_URL": OPENROUTER_BASE_URL,
+        "OPENROUTER_MODEL": slug,
+        "KIMI_SHARE_DIR": str(kimi_share_dir()),
+        "WORKDIR": workdir(),
+    }
+    key = resolve_openrouter_api_key()
+    if key:
+        env["OPENROUTER_API_KEY"] = key
+        env["OPENAI_API_KEY"] = key
+        env["KIMI_API_KEY"] = key
+        env["MOONSHOT_API_KEY"] = key
+    home = env_first("HOME")
+    if home:
+        env["HOME"] = home
+    return env
+
+
 def graph_runtime_env() -> dict[str, str]:
     """Env that keeps in-task nodes off the runner ``BASH_ENV`` / PATH kimi hooks.
 
     LocalRunner copies ``os.environ`` then overlays node env, so these win
     on the already-published runner image (no new ECR build required).
     Strings only — no disk writes. Safe to embed in emitted PipelineSpec.
+
+    ``BASH_ENV=/dev/null`` + ``MIDKERNEL_NODE_READY=1`` skip runner
+    ``prepare_node`` (avoids re-clone). OpenRouter config must therefore
+    travel on the node env / ``$WORKDIR/.midkernel/kimi/config.toml``.
     """
     bin_path = pinned_kimi_bin()
     shim = str(kimi_shim_dir())
@@ -866,6 +1019,7 @@ def graph_runtime_env() -> dict[str, str]:
         "KIMI_REAL_BIN": bin_path,
         "PATH": os.pathsep.join([shim, *parts]) if parts else shim,
     }
+    env.update(openrouter_passthrough_env())
     return env
 
 
@@ -1016,6 +1170,7 @@ def kimi_io_env(
 ) -> dict[str, str]:
     nid = safe_node_id(node_id)
     env = graph_runtime_env()
+    env.update(openrouter_passthrough_env(model=model))
     env.update(
         {
             "MIDKERNEL_NODE_ID": nid,
@@ -1027,6 +1182,7 @@ def kimi_io_env(
     )
     if model:
         env["MIDKERNEL_NODE_MODEL"] = model
+        env["OPENROUTER_MODEL"] = normalize_openrouter_slug(model)
     if parent_id or is_dynamic_node(nid):
         env["MIDKERNEL_NODE_PARENT"] = parent_id or "surface-split"
     if is_dynamic_node(nid) if dynamic is None else dynamic:
@@ -1130,10 +1286,27 @@ def wrap_kimi(argv: list[str]) -> int:
         print(f"node io: {error}", file=sys.stderr)
         finish_node(node_id, status="failed", error=error)
         return 1
+    model = env_first("MIDKERNEL_NODE_MODEL", "OPENROUTER_MODEL", "MODEL") or None
+    argv, config_path = ensure_kimi_config_argv(argv, model=model)
+    child_env = os.environ.copy()
+    child_env.update(openrouter_passthrough_env(model=model))
+    key = resolve_openrouter_api_key()
+    if key:
+        child_env["OPENROUTER_API_KEY"] = key
+        child_env["OPENAI_API_KEY"] = key
+        child_env["KIMI_API_KEY"] = key
+        child_env["MOONSHOT_API_KEY"] = key
+    child_env["KIMI_SHARE_DIR"] = str(config_path.parent)
+    print(
+        f"node io: kimi OpenRouter config={config_path} "
+        f"model={child_env.get('OPENROUTER_MODEL', '')} "
+        f"key_set={'yes' if key else 'no'} bin={binary}",
+        file=sys.stderr,
+    )
     command = [binary, *argv]
     error = None
     try:
-        result = subprocess.run(command, check=False)
+        result = subprocess.run(command, check=False, env=child_env)
         code = int(result.returncode)
     except Exception as exc:  # noqa: BLE001
         code = 1

@@ -406,6 +406,52 @@ def test_kimi_io_env_always_pins_real_bin() -> None:
     assert env["BASH_ENV"] == "/dev/null"
     assert env["MIDKERNEL_NODE_READY"] == "1"
     assert env["MIDKERNEL_NODE_ID"] == "threat-model"
+    assert env["OPENAI_BASE_URL"] == io.OPENROUTER_BASE_URL
+    assert env["OPENROUTER_MODEL"]
+    assert env["KIMI_SHARE_DIR"].endswith(".midkernel/kimi")
+
+
+def test_kimi_io_env_passes_openrouter_keys(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("WORKDIR", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    monkeypatch.setenv("OPENROUTER_MODEL", "openrouter/anthropic/claude-sonnet-4.5")
+    env = io.kimi_io_env("hunter-1", outputs=["findings/hunter-1/RESULT.md"], model="anthropic/claude-sonnet-4.5")
+    assert env["OPENROUTER_API_KEY"] == "sk-or-test"
+    assert env["OPENAI_API_KEY"] == "sk-or-test"
+    assert env["KIMI_API_KEY"] == "sk-or-test"
+    assert env["HOME"] == str(tmp_path / "home")
+    assert env["OPENROUTER_MODEL"] == "anthropic/claude-sonnet-4.5"
+    assert env["KIMI_SHARE_DIR"] == str(tmp_path / ".midkernel" / "kimi")
+
+
+def test_ensure_kimi_config_rewrites_inline_toml(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("WORKDIR", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-live")
+    inline = io.render_kimi_openrouter_config("moonshotai/kimi-k3")
+    argv, path = io.ensure_kimi_config_argv(
+        ["--print", "--yolo", "-p", "hi", "--config", inline],
+        model="moonshotai/kimi-k3",
+    )
+    assert path.is_file()
+    assert argv[-2:] == ["--config", str(path)]
+    assert "\n" not in argv[-1]
+    text = path.read_text(encoding="utf-8")
+    assert "openai_legacy" in text
+    assert "sk-or-live" in text
+    assert "moonshotai/kimi-k3" in text
+
+
+def test_resolve_openrouter_key_from_workdir_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("WORKDIR", str(tmp_path))
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("KIMI_API_KEY", raising=False)
+    (tmp_path / ".midkernel-openrouter").write_text("sk-from-prepare\n", encoding="utf-8")
+    assert io.resolve_openrouter_api_key() == "sk-from-prepare"
 
 
 def test_node_io_gate_silent_without_run(
