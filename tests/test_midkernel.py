@@ -94,6 +94,61 @@ def test_prepare_script_bakes_playbook_defaults() -> None:
     assert 'GITHUB_REF="${GITHUB_REF:-main}"' in firedancer
 
 
+def test_goal_count_defaults_and_clamps(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("GOAL_COUNT", raising=False)
+    assert mk.goal_count() == 6
+    monkeypatch.setenv("GOAL_COUNT", "3")
+    assert mk.goal_count() == 3
+    monkeypatch.setenv("GOAL_COUNT", "99")
+    assert mk.goal_count() == 6
+    monkeypatch.setenv("GOAL_COUNT", "nope")
+    assert mk.goal_count() == 6
+
+
+def test_judge_models_stay_distinct_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("JUDGE_A_MODEL", raising=False)
+    monkeypatch.delenv("JUDGE_B_MODEL", raising=False)
+    monkeypatch.delenv("OPENROUTER_MODEL", raising=False)
+    monkeypatch.delenv("MODEL", raising=False)
+    assert mk.judge_a_model() == "moonshotai/kimi-k3"
+    assert mk.judge_b_model() == "anthropic/claude-sonnet-4.5"
+    monkeypatch.setenv("OPENROUTER_MODEL", "anthropic/claude-sonnet-4.5")
+    assert mk.judge_a_model() == "anthropic/claude-sonnet-4.5"
+    assert mk.judge_b_model() == "openai/gpt-4o"
+    monkeypatch.setenv("JUDGE_B_MODEL", "openrouter/google/gemini-2.5-pro")
+    assert mk.judge_b_model() == "google/gemini-2.5-pro"
+
+
+def test_goal_playbook_prompt_and_no_default_target() -> None:
+    prompt = mk.playbook_prompt("goal-security-review")
+    assert "THREAT_MODEL.md" in prompt
+    assert "GOAL_COUNT" in prompt
+    assert "known-findings" in prompt or "known-issues" in prompt
+    assert not prompt.startswith("---")
+    assert mk.default_target("goal-security-review") is None
+
+
+def test_goal_prompts_omit_github_dedupe() -> None:
+    hunter = mk.hunter_prompt("goal-security-review", 3)
+    assert "goals/03-" in hunter
+    assert "no-op" in hunter.lower()
+    assert "Do not search local known-findings" in hunter
+    assert "open GitHub issues/PRs" in hunter
+    split = mk.surface_split_prompt("goal-security-review")
+    assert "GitHub-issue/PR duplicate" in split or "GitHub issues/PRs" in split
+    assert "Do not prescribe" in mk.threat_model_prompt("goal-security-review")
+
+
+def test_build_scan_graph_unchanged_shape() -> None:
+    pytest.importorskip("agentflow")
+    graph = mk.build_scan_graph(
+        "security-review",
+        description="unchanged scan graph",
+    )
+    ids = [node["id"] for node in graph.to_payload()["nodes"]]
+    assert ids == ["prepare", "review", "publish"]
+
+
 def test_review_prompt_names_default_targets() -> None:
     security = mk.review_prompt("security-review")
     assert "no default target" in security
