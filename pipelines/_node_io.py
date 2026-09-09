@@ -63,10 +63,12 @@ OPENROUTER_KEY_PLACEHOLDER = "OVERRIDE_VIA_ENV"
 # model catalog (or remaining-context) default of 131072, which 402s typical
 # keys as in_flight_budget_exhausted (run cmtufzqzo0003k004mt2w0m9c).
 DEFAULT_KIMI_MAX_TOKENS = 32768
+MAX_SAFE_KIMI_MAX_TOKENS = 65536
 UNSAFE_OPENROUTER_MAX_TOKENS = 131072
 MAX_TOKENS_ENV_NAMES = (
     "KIMI_MAX_TOKENS",
     "OPENROUTER_MAX_TOKENS",
+    "MIDKERNEL_OPENROUTER_MAX_TOKENS",
     "KIMI_MODEL_MAX_COMPLETION_TOKENS",
     "KIMI_MODEL_MAX_TOKENS",
 )
@@ -95,28 +97,45 @@ def env_first(*names: str, default: str = "") -> str:
     return default
 
 
+def clamp_kimi_max_tokens(value: int) -> int:
+    """Wallet-safe completion cap. Hard ceiling 65536; 131072 is never opt-in.
+
+    ``131072`` is the exact OpenRouter reservation that 402s typical keys
+    (run ``cmtufzqzo0003k004mt2w0m9c``). Values ``>= 131072`` or otherwise
+    above ``65536`` fall back to the ``32768`` default — they do not become
+    a valid override. Config writers stay in lockstep with runner#8
+    (``max_tokens = 32768`` next to ``max_context_size``).
+    """
+    if value <= 0:
+        return DEFAULT_KIMI_MAX_TOKENS
+    if value >= UNSAFE_OPENROUTER_MAX_TOKENS:
+        return DEFAULT_KIMI_MAX_TOKENS
+    if value > MAX_SAFE_KIMI_MAX_TOKENS:
+        return DEFAULT_KIMI_MAX_TOKENS
+    return value
+
+
 def kimi_max_tokens() -> int:
     """Per-request OpenRouter ``max_tokens`` for every Kimi node.
 
-    Default ``32768``. Override with ``KIMI_MAX_TOKENS`` / ``OPENROUTER_MAX_TOKENS``
-    (or kimi-cli ``KIMI_MODEL_MAX_COMPLETION_TOKENS`` / ``KIMI_MODEL_MAX_TOKENS``).
+    Default ``32768``. Hard ceiling ``65536``. Override with ``KIMI_MAX_TOKENS``
+    / ``OPENROUTER_MAX_TOKENS`` / ``MIDKERNEL_OPENROUTER_MAX_TOKENS`` (or
+    kimi-cli ``KIMI_MODEL_MAX_COMPLETION_TOKENS`` / ``KIMI_MODEL_MAX_TOKENS``).
     ``0`` / negative are ignored — kimi-cli treats those as “disable clamp”,
-    which restores the 131072 reservation that 402s typical keys. 131072 is
-    allowed only when an override is set explicitly to that value.
+    which restores the 131072 reservation that 402s typical keys. ``131072``
+    is **not** a valid opt-in (that is the exact 402 reservation).
     """
     raw = env_first(*MAX_TOKENS_ENV_NAMES, default=str(DEFAULT_KIMI_MAX_TOKENS))
     try:
         value = int(raw)
     except ValueError:
         return DEFAULT_KIMI_MAX_TOKENS
-    if value <= 0:
-        return DEFAULT_KIMI_MAX_TOKENS
-    return value
+    return clamp_kimi_max_tokens(value)
 
 
 def max_tokens_env(cap: int | None = None) -> dict[str, str]:
     """Bake the generation cap onto every Kimi node / wrap child env."""
-    n = str(kimi_max_tokens() if cap is None else cap)
+    n = str(clamp_kimi_max_tokens(kimi_max_tokens() if cap is None else int(cap)))
     return {name: n for name in MAX_TOKENS_ENV_NAMES}
 
 
@@ -125,8 +144,10 @@ def cap_openrouter_payload(payload: dict[str, Any], cap: int) -> dict[str, Any]:
 
     OpenRouter reserves ``max_tokens`` against in-flight budget. Omitting it
     (or sending 131072) is the 402. Always set ``max_tokens``; also clamp
-    ``max_completion_tokens`` when present.
+    ``max_completion_tokens`` when present. The cap itself is clamped so a
+    caller cannot opt in to the 131072 reservation.
     """
+    cap = clamp_kimi_max_tokens(int(cap))
     out = dict(payload)
     for key in ("max_tokens", "max_completion_tokens"):
         if key not in out:
@@ -205,7 +226,7 @@ class OpenRouterMaxTokensProxy:
     """
 
     def __init__(self, cap: int, *, upstream_base: str = OPENROUTER_BASE_URL) -> None:
-        self.cap = cap
+        self.cap = clamp_kimi_max_tokens(int(cap))
         self.upstream_base = upstream_base.rstrip("/")
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -1110,7 +1131,7 @@ def render_kimi_openrouter_config(
         default=DEFAULT_OPENROUTER_MODEL,
     )
     key = (api_key if api_key is not None else resolve_openrouter_api_key()) or OPENROUTER_KEY_PLACEHOLDER
-    cap = kimi_max_tokens() if max_tokens is None else max_tokens
+    cap = clamp_kimi_max_tokens(kimi_max_tokens() if max_tokens is None else int(max_tokens))
     url = (base_url or OPENROUTER_BASE_URL).rstrip("/")
     return "\n".join(
         [
@@ -1127,6 +1148,10 @@ def render_kimi_openrouter_config(
             'provider = "openrouter"',
             f'model = "{slug}"',
             "max_context_size = 262144",
+            # Completion budget only. Never copy max_context_size here —
+            # OpenRouter 402 in_flight_budget_exhausted on 131072
+            # (GOAL cmtufzqzo0003k004mt2w0m9c). Lockstep with runner#8.
+            f"max_tokens = {cap}",
             f"max_output_size = {cap}",
             "",
         ]

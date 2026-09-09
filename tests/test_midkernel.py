@@ -54,19 +54,17 @@ def test_kimi_config_is_openrouter_legacy() -> None:
     assert "openrouter.ai/api/v1" in config
     assert "moonshotai/kimi-k3" in config
     assert "bedrock" not in config.lower()
+    assert "max_tokens = 32768" in config
     assert "max_output_size = 32768" in config
     assert "131072" not in config
 
 
 def test_kimi_max_tokens_default_and_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in (
-        "KIMI_MAX_TOKENS",
-        "OPENROUTER_MAX_TOKENS",
-        "KIMI_MODEL_MAX_COMPLETION_TOKENS",
-        "KIMI_MODEL_MAX_TOKENS",
-    ):
+    for name in mk.MAX_TOKENS_ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
     assert mk.kimi_max_tokens() == mk.DEFAULT_KIMI_MAX_TOKENS == 32768
+    assert mk.MAX_SAFE_KIMI_MAX_TOKENS == 65536
+    assert mk.UNSAFE_OPENROUTER_MAX_TOKENS == 131072
     monkeypatch.setenv("KIMI_MAX_TOKENS", "0")
     assert mk.kimi_max_tokens() == 32768
     monkeypatch.setenv("KIMI_MAX_TOKENS", "-1")
@@ -76,8 +74,19 @@ def test_kimi_max_tokens_default_and_env(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setenv("OPENROUTER_MAX_TOKENS", "65536")
     monkeypatch.delenv("KIMI_MAX_TOKENS", raising=False)
     assert mk.kimi_max_tokens() == 65536
+    monkeypatch.setenv("MIDKERNEL_OPENROUTER_MAX_TOKENS", "65536")
+    monkeypatch.delenv("OPENROUTER_MAX_TOKENS", raising=False)
+    assert mk.kimi_max_tokens() == 65536
+    # 131072 is the exact 402 reservation — not a valid opt-in.
     monkeypatch.setenv("KIMI_MAX_TOKENS", "131072")
-    assert mk.kimi_max_tokens() == 131072
+    assert mk.kimi_max_tokens() == 32768
+    monkeypatch.setenv("KIMI_MAX_TOKENS", "80000")
+    assert mk.kimi_max_tokens() == 32768
+    monkeypatch.setenv("KIMI_MAX_TOKENS", "65536")
+    assert mk.kimi_max_tokens() == 65536
+    assert mk.clamp_kimi_max_tokens(131072) == 32768
+    assert mk.clamp_kimi_max_tokens(65537) == 32768
+    assert mk.clamp_kimi_max_tokens(65536) == 65536
 
 
 def test_kimi_extra_args_is_config_file_path() -> None:
@@ -92,12 +101,7 @@ def test_openrouter_node_env_passthrough(monkeypatch: pytest.MonkeyPatch, tmp_pa
     monkeypatch.setenv("WORKDIR", str(tmp_path))
     monkeypatch.setenv("HOME", str(tmp_path / "agent"))
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-emit")
-    for name in (
-        "KIMI_MAX_TOKENS",
-        "OPENROUTER_MAX_TOKENS",
-        "KIMI_MODEL_MAX_COMPLETION_TOKENS",
-        "KIMI_MODEL_MAX_TOKENS",
-    ):
+    for name in mk.MAX_TOKENS_ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
     env = mk.openrouter_node_env(model="moonshotai/kimi-k3")
     assert env["OPENROUTER_API_KEY"] == "sk-or-emit"
@@ -107,6 +111,7 @@ def test_openrouter_node_env_passthrough(monkeypatch: pytest.MonkeyPatch, tmp_pa
     assert env["KIMI_SHARE_DIR"] == str(tmp_path / ".midkernel" / "kimi")
     assert env["KIMI_MAX_TOKENS"] == "32768"
     assert env["OPENROUTER_MAX_TOKENS"] == "32768"
+    assert env["MIDKERNEL_OPENROUTER_MAX_TOKENS"] == "32768"
     assert env["KIMI_MODEL_MAX_COMPLETION_TOKENS"] == "32768"
 
 
@@ -141,10 +146,14 @@ def test_prepare_script_bakes_playbook_defaults() -> None:
     assert "KIMI_SHARE_DIR" in security
     assert "$KIMI_SHARE_DIR/config.toml" in security
     assert "$WORKDIR/.midkernel-openrouter" in security
+    assert "max_tokens = ${KIMI_MAX_TOKENS}" in security
     assert "max_output_size = ${KIMI_MAX_TOKENS}" in security
     assert "KIMI_MAX_TOKENS=" in security
+    assert "MIDKERNEL_OPENROUTER_MAX_TOKENS=" in security
     assert "32768" in security
+    assert "max_tokens = 131072" not in security
     assert "max_output_size = 131072" not in security
+    assert "-gt 65536" in security
 
     solana = mk.prepare_script("solana-validator-security")
     assert "PLAYBOOK_SLUG:-solana-validator-security" in solana
@@ -205,12 +214,7 @@ def test_goal_prompts_omit_github_dedupe() -> None:
 
 def test_build_scan_graph_unchanged_shape(monkeypatch: pytest.MonkeyPatch) -> None:
     pytest.importorskip("agentflow")
-    for name in (
-        "KIMI_MAX_TOKENS",
-        "OPENROUTER_MAX_TOKENS",
-        "KIMI_MODEL_MAX_COMPLETION_TOKENS",
-        "KIMI_MODEL_MAX_TOKENS",
-    ):
+    for name in mk.MAX_TOKENS_ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
     graph = mk.build_scan_graph(
         "security-review",
@@ -228,6 +232,7 @@ def test_build_scan_graph_unchanged_shape(monkeypatch: pytest.MonkeyPatch) -> No
     assert nodes["review"]["env"]["MIDKERNEL_KIMI_BIN"]
     assert nodes["review"]["env"]["KIMI_MAX_TOKENS"] == "32768"
     assert nodes["review"]["env"]["OPENROUTER_MAX_TOKENS"] == "32768"
+    assert nodes["review"]["env"]["MIDKERNEL_OPENROUTER_MAX_TOKENS"] == "32768"
     assert nodes["prepare"]["env"]["BASH_ENV"] == "/dev/null"
     assert nodes["publish"]["env"]["MIDKERNEL_NODE_READY"] == "1"
     assert "python3" in nodes["prepare"]["prompt"]

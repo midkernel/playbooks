@@ -15,7 +15,11 @@ from typing import Any
 try:
     from ._node_io import (  # type: ignore[import-not-found]
         DEFAULT_KIMI_MAX_TOKENS,
+        MAX_SAFE_KIMI_MAX_TOKENS,
+        MAX_TOKENS_ENV_NAMES,
+        UNSAFE_OPENROUTER_MAX_TOKENS,
         bootstrap_run_io,
+        clamp_kimi_max_tokens,
         kimi_config_file,
         kimi_executable,
         kimi_io_env,
@@ -28,7 +32,11 @@ try:
 except ImportError:  # ``python3 pipelines/<slug>.py`` puts this dir on sys.path
     from _node_io import (  # type: ignore[import-not-found]
         DEFAULT_KIMI_MAX_TOKENS,
+        MAX_SAFE_KIMI_MAX_TOKENS,
+        MAX_TOKENS_ENV_NAMES,
+        UNSAFE_OPENROUTER_MAX_TOKENS,
         bootstrap_run_io,
+        clamp_kimi_max_tokens,
         kimi_config_file,
         kimi_executable,
         kimi_io_env,
@@ -373,7 +381,7 @@ THREAT="${THREAT:-${THREAT_PIN:-}}"
 ARTIFACTS_BUCKET="${ARTIFACTS_BUCKET:-midkernel-dev-artifacts}"
 ARTIFACTS_PREFIX="${ARTIFACTS_PREFIX:-runs/}"
 OPENROUTER_MODEL="${OPENROUTER_MODEL:-${MODEL:-moonshotai/kimi-k3}}"
-KIMI_MAX_TOKENS="${KIMI_MAX_TOKENS:-${OPENROUTER_MAX_TOKENS:-${KIMI_MODEL_MAX_COMPLETION_TOKENS:-${KIMI_MODEL_MAX_TOKENS:-__KIMI_MAX_TOKENS__}}}}"
+KIMI_MAX_TOKENS="${KIMI_MAX_TOKENS:-${OPENROUTER_MAX_TOKENS:-${MIDKERNEL_OPENROUTER_MAX_TOKENS:-${KIMI_MODEL_MAX_COMPLETION_TOKENS:-${KIMI_MODEL_MAX_TOKENS:-__KIMI_MAX_TOKENS__}}}}}"
 OPENROUTER_SECRET_ID="${OPENROUTER_SECRET_ID:-midkernel/dev/harness/openrouter-api-key}"
 GITHUB_TOKEN_SECRET_ID="${GITHUB_TOKEN_SECRET_ID:-midkernel/dev/harness/github-token}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
@@ -386,13 +394,19 @@ case "$OPENROUTER_MODEL" in
   openrouter/*) OPENROUTER_MODEL="${OPENROUTER_MODEL#openrouter/}" ;;
 esac
 # 0 / non-numeric would disable kimi-cli's clamp and restore the catalog default.
+# Hard ceiling 65536. 131072 is the exact 402 reservation — never a valid opt-in.
 case "$KIMI_MAX_TOKENS" in
   ''|*[!0-9]*|0) KIMI_MAX_TOKENS="__KIMI_MAX_TOKENS__" ;;
 esac
+# Values >=131072 or otherwise above 65536 become the 32768 default.
+if [ "$KIMI_MAX_TOKENS" -gt 65536 ] 2>/dev/null; then
+  KIMI_MAX_TOKENS="__KIMI_MAX_TOKENS__"
+fi
 export KIMI_MAX_TOKENS
-export OPENROUTER_MAX_TOKENS="${OPENROUTER_MAX_TOKENS:-$KIMI_MAX_TOKENS}"
-export KIMI_MODEL_MAX_COMPLETION_TOKENS="${KIMI_MODEL_MAX_COMPLETION_TOKENS:-$KIMI_MAX_TOKENS}"
-export KIMI_MODEL_MAX_TOKENS="${KIMI_MODEL_MAX_TOKENS:-$KIMI_MAX_TOKENS}"
+export OPENROUTER_MAX_TOKENS="$KIMI_MAX_TOKENS"
+export MIDKERNEL_OPENROUTER_MAX_TOKENS="$KIMI_MAX_TOKENS"
+export KIMI_MODEL_MAX_COMPLETION_TOKENS="$KIMI_MAX_TOKENS"
+export KIMI_MODEL_MAX_TOKENS="$KIMI_MAX_TOKENS"
 
 export WORKDIR
 export OUTPUTS_DIR
@@ -501,6 +515,7 @@ api_key = "${OPENROUTER_API_KEY}"
 provider = "openrouter"
 model = "${OPENROUTER_MODEL}"
 max_context_size = 262144
+max_tokens = ${KIMI_MAX_TOKENS}
 max_output_size = ${KIMI_MAX_TOKENS}
 EOF
 chmod 600 "$KIMI_SHARE_DIR/config.toml" || true

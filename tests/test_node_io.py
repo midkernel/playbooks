@@ -404,12 +404,7 @@ def test_real_kimi_bin_skips_report_md_wrapper(
 
 
 def test_kimi_io_env_always_pins_real_bin(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in (
-        "KIMI_MAX_TOKENS",
-        "OPENROUTER_MAX_TOKENS",
-        "KIMI_MODEL_MAX_COMPLETION_TOKENS",
-        "KIMI_MODEL_MAX_TOKENS",
-    ):
+    for name in io.MAX_TOKENS_ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
     env = io.kimi_io_env("threat-model", outputs=["THREAT_MODEL.md"])
     assert env["MIDKERNEL_KIMI_BIN"]
@@ -435,6 +430,7 @@ def test_kimi_io_env_passes_openrouter_keys(monkeypatch: pytest.MonkeyPatch, tmp
     assert env["KIMI_SHARE_DIR"] == str(tmp_path / ".midkernel" / "kimi")
     assert env["KIMI_MAX_TOKENS"] == "32768"
     assert env["OPENROUTER_MAX_TOKENS"] == "32768"
+    assert env["MIDKERNEL_OPENROUTER_MAX_TOKENS"] == "32768"
 
 
 def test_ensure_kimi_config_rewrites_inline_toml(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -453,6 +449,7 @@ def test_ensure_kimi_config_rewrites_inline_toml(tmp_path: Path, monkeypatch: py
     assert "openai_legacy" in text
     assert "sk-or-live" in text
     assert "moonshotai/kimi-k3" in text
+    assert "max_tokens = 32768" in text
     assert "max_output_size = 32768" in text
     assert "131072" not in text
 
@@ -515,6 +512,21 @@ def test_cap_openrouter_payload_never_leaves_131072() -> None:
     assert kept["max_tokens"] == 1024
     zeroed = io.cap_openrouter_payload({"max_tokens": 0}, cap)
     assert zeroed["max_tokens"] == 32768
+    # A caller-supplied cap of 131072 is itself unsafe and becomes 32768.
+    unsafe_cap = io.cap_openrouter_payload({"max_tokens": 131072}, 131072)
+    assert unsafe_cap["max_tokens"] == 32768
+
+
+def test_render_kimi_config_writes_max_tokens_and_rejects_131072() -> None:
+    text = io.render_kimi_openrouter_config("moonshotai/kimi-k3", max_tokens=32768)
+    assert "max_tokens = 32768" in text
+    assert "max_output_size = 32768" in text
+    assert "131072" not in text
+    rejected = io.render_kimi_openrouter_config("moonshotai/kimi-k3", max_tokens=131072)
+    assert "max_tokens = 32768" in rejected
+    assert "max_tokens = 131072" not in rejected
+    ceiling = io.render_kimi_openrouter_config("moonshotai/kimi-k3", max_tokens=65536)
+    assert "max_tokens = 65536" in ceiling
 
 
 def test_openrouter_proxy_injects_max_tokens() -> None:
@@ -611,3 +623,26 @@ def test_wrap_kimi_uploads_result_when_model_writes_it(
     )
     assert "clean miss" in output
     assert "invent" not in output.lower()
+    config = (tmp_path / ".midkernel" / "kimi" / "config.toml").read_text(encoding="utf-8")
+    assert "max_tokens = 32768" in config
+    assert "max_tokens = 131072" not in config
+
+
+def test_wrap_kimi_rejects_131072_env_in_written_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "kimi.bin"
+    fake.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setenv("MIDKERNEL_KIMI_BIN", str(fake))
+    monkeypatch.setenv("WORKDIR", str(tmp_path))
+    monkeypatch.setenv("RUN_ID", "run-cap-131072")
+    monkeypatch.setenv("MIDKERNEL_IO_DIR", str(tmp_path / "s3"))
+    monkeypatch.setenv("MIDKERNEL_IO_SKIP_S3", "1")
+    monkeypatch.setenv("MIDKERNEL_NODE_IO", "1")
+    monkeypatch.setenv("MIDKERNEL_NODE_ID", "hunter-1")
+    monkeypatch.setenv("KIMI_MAX_TOKENS", "131072")
+    assert io.main(["-p", "hunt"]) == 0
+    config = (tmp_path / ".midkernel" / "kimi" / "config.toml").read_text(encoding="utf-8")
+    assert "max_tokens = 32768" in config
+    assert "max_tokens = 131072" not in config
