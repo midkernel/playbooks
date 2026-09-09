@@ -75,6 +75,10 @@ def _load(slug: str, env: dict[str, str] | None = None) -> dict:
         "MIDKERNEL_OPENROUTER_MAX_TOKENS",
         "KIMI_MODEL_MAX_COMPLETION_TOKENS",
         "KIMI_MODEL_MAX_TOKENS",
+        "OPENROUTER_MODEL",
+        "MODEL",
+        "JUDGE_A_MODEL",
+        "JUDGE_B_MODEL",
     ):
         if not env or name not in env:
             merged.pop(name, None)
@@ -124,7 +128,7 @@ def test_security_review_graph_is_kimi_openrouter_on_midkernel_ecs() -> None:
     assert review["provider"]["name"] == "openrouter"
     assert review["provider"]["base_url"] == "https://openrouter.ai/api/v1"
     assert review["provider"]["api_key_env"] == "OPENROUTER_API_KEY"
-    assert review["model"] == "moonshotai/kimi-k3"
+    assert review["model"] == "google/gemini-3.8-flash"
     assert review["tools"] == "read_write"
 
     target = review["target"]
@@ -263,7 +267,7 @@ def test_goal_security_review_graph_nodes_and_openrouter_lock() -> None:
     assert threat["extra_args"][1].endswith("config.toml")
     assert "default_model" not in threat["extra_args"][1]
 
-    assert nodes["judge-a"]["model"] == "moonshotai/kimi-k3"
+    assert nodes["judge-a"]["model"] == "google/gemini-3.8-flash"
     assert nodes["judge-b"]["model"] != nodes["judge-a"]["model"]
     assert nodes["judge-b"]["model"] == "anthropic/claude-sonnet-4.5"
 
@@ -323,6 +327,16 @@ def test_goal_security_review_local_in_task_override() -> None:
     assemble = next(node for node in spec["nodes"] if node["id"] == "assemble")
     assert assemble["target"]["kind"] == "local"
     assert assemble["target"]["cwd"].endswith("/repo")
+
+
+def test_openrouter_model_env_overrides_balanced_default() -> None:
+    """App injects per-profile Pareto Scan presets via OPENROUTER_MODEL / MODEL."""
+    spec = _load("security-review", env={"OPENROUTER_MODEL": "moonshotai/kimi-k3"})
+    review = next(node for node in spec["nodes"] if node["id"] == "review")
+    assert review["model"] == "moonshotai/kimi-k3"
+    via_model = _load("security-review", env={"MODEL": "openrouter/anthropic/claude-sonnet-4.5"})
+    review = next(node for node in via_model["nodes"] if node["id"] == "review")
+    assert review["model"] == "anthropic/claude-sonnet-4.5"
 
 
 def test_goal_security_review_judge_models_follow_env() -> None:

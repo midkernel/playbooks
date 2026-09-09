@@ -494,13 +494,16 @@ def test_real_kimi_bin_skips_report_md_wrapper(
 def test_kimi_io_env_always_pins_real_bin(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in io.MAX_TOKENS_ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("OPENROUTER_MODEL", raising=False)
+    monkeypatch.delenv("MODEL", raising=False)
     env = io.kimi_io_env("threat-model", outputs=["THREAT_MODEL.md"])
     assert env["MIDKERNEL_KIMI_BIN"]
     assert env["BASH_ENV"] == "/dev/null"
     assert env["MIDKERNEL_NODE_READY"] == "1"
     assert env["MIDKERNEL_NODE_ID"] == "threat-model"
     assert env["OPENAI_BASE_URL"] == io.OPENROUTER_BASE_URL
-    assert env["OPENROUTER_MODEL"]
+    assert io.DEFAULT_OPENROUTER_MODEL == "google/gemini-3.8-flash"
+    assert env["OPENROUTER_MODEL"] == "google/gemini-3.8-flash"
     assert env["KIMI_SHARE_DIR"].endswith(".midkernel/kimi")
 
 

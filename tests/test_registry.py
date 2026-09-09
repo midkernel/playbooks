@@ -51,6 +51,9 @@ def test_readme_documents_openrouter_lock_and_default_targets() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "OpenRouter" in readme
     assert "Kimi" in readme
+    assert "google/gemini-3.8-flash" in readme
+    assert "Pareto Scan" in readme
+    assert "per-profile" in readme.lower() or "per Scan profile" in readme
     assert "not required" in readme.lower()
     assert "OpenCode" in readme
     assert "list_playbooks" in readme

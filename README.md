@@ -98,12 +98,12 @@ Coordinate names with `midkernel/app` (`src/lib/agentflow-contract.ts`) and `mid
 | `PROFILE` | `SCAN_PROFILE` | no | `low` \| `balanced` \| `max` |
 | `THREAT` | `THREAT_PIN` | no | Optional pin, max 80 chars. Not a fourth profile. `goal-security-review` folds it into `THREAT_MODEL.md` |
 | `GOAL_COUNT` | same | no | `goal-security-review` only. How many goal files to author **and** how many `hunter-*` nodes to emit. Default **6** (5 surfaces + 1 open roam). Max 6 |
-| `JUDGE_A_MODEL` | same | no | OpenRouter slug for the relevance judge. Default `OPENROUTER_MODEL` / `moonshotai/kimi-k3` |
+| `JUDGE_A_MODEL` | same | no | OpenRouter slug for the relevance judge. Default `OPENROUTER_MODEL` / `google/gemini-3.8-flash` (balanced Pareto Scan preset) |
 | `JUDGE_B_MODEL` | same | no | OpenRouter slug for the PoC/exploitability judge. Default `anthropic/claude-sonnet-4.5` (falls back to `openai/gpt-4o` if that would match judge-a) |
 | `ARTIFACTS_BUCKET` | same | no | Default `midkernel-dev-artifacts` |
 | `ARTIFACTS_PREFIX` | same | no | Default `runs/` |
 | `ARTIFACTS_KEY` | same | no | Default `runs/<RUN_ID>/report.md` |
-| `MODEL` / `OPENROUTER_MODEL` | `OPENROUTER_MODEL` | no | OpenRouter slug, default `moonshotai/kimi-k3` (optional `openrouter/` prefix) |
+| `MODEL` / `OPENROUTER_MODEL` | `OPENROUTER_MODEL` | no | OpenRouter slug. App injects the per-profile Pareto Scan preset. Fallback when unset: `google/gemini-3.8-flash` (balanced). Optional `openrouter/` prefix. Not Kimi-only. |
 | `MIDKERNEL_OPENROUTER_MAX_TOKENS` / `OPENROUTER_MAX_TOKENS` / `KIMI_MAX_TOKENS` / `KIMI_MODEL_MAX_TOKENS` / `KIMI_MODEL_MAX_COMPLETION_TOKENS` | same (runner first-wins order) | no | Per-request OpenRouter generation cap (`max_tokens`). **First-wins** matches runner: `MIDKERNEL_OPENROUTER_MAX_TOKENS`, then `OPENROUTER_MAX_TOKENS`, then `KIMI_MAX_TOKENS`, then `KIMI_MODEL_MAX_TOKENS`, then `KIMI_MODEL_MAX_COMPLETION_TOKENS`. Default **16384**. Hard ceiling **65536**. `131072` is **not** a valid opt-in (that reservation is the 402). Values `>65536` or `>=131072` become **16384**. Baked onto every Kimi node in `emit()` / `emit_goal()`. `0` / negative are ignored (kimi-cli would disable the clamp). See [OpenRouter `max_tokens` cap](#openrouter-max_tokens-cap-402) |
 | `GITHUB_REF` | same | no | Shallow clone `--branch`. Playbooks with `target_ref` default that ref |
 | `GITHUB_TOKEN` | same | yes* | Installation token; else SM `midkernel/dev/harness/github-token` |
@@ -221,7 +221,7 @@ Graph (shared-workspace file handoff under the cloned repo):
 3. **goal-author** — from the threat model, write N goal prompts under `goals/` (`01-*.md` …). Each file is one precise success condition. Self-red-teams lazy outs. `GOAL_COUNT` default **6** (5 surfaces + 1 open roam).
 4. **surface-split** — read the tree + threat model; assign surfaces / open roam into those goal files. Persistence: “no bugs found yet” is not done.
 5. **hunter-1** … **hunter-N** — first-class dynamic nodes from `GOAL_COUNT` (default 6). **Serialized**: `hunter-2` depends on `hunter-1`, and so on (graph `concurrency=1`). Do not run them in parallel — that is the OpenRouter 429 new-account RPM failure (`cmtun51000003l704q7lyyjrf`). Each picks `goals/0N-*.md` if present and no-ops cleanly if missing. Candidates go under `findings/hunter-N/`. **No** known-issues / GitHub issue-or-PR duplicate search. `graph.json` records `surface-split → hunter-1 → … → hunter-N` plus each hunter → `judge-a`.
-6. **judge-a** — security-relevance vs `THREAT_MODEL.md` (default Kimi / `OPENROUTER_MODEL`). Survivors → `findings/validated-a/`.
+6. **judge-a** — security-relevance vs `THREAT_MODEL.md` (default `OPENROUTER_MODEL` / balanced Pareto Scan preset `google/gemini-3.8-flash`). Survivors → `findings/validated-a/`.
 7. **judge-b** — PoC / exploitability on a **different** OpenRouter model (default `anthropic/claude-sonnet-4.5`). Survivors → `findings/validated-b/`.
 8. **assemble** — only dual-pass survivors → `report.md`. Empty findings with evidence of what was tried is allowed. Never invent. No stub language.
 9. **publish** — same `PUBLISH_SCRIPT` (nonempty, non-stub `report.md` or fail closed).
