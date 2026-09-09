@@ -73,12 +73,15 @@ def test_readme_documents_openrouter_lock_and_default_targets() -> None:
     assert "MIDKERNEL_OPENROUTER_MAX_TOKENS" in readme
     assert "KIMI_MODEL_MAX_TOKENS" in readme
     assert "first-wins" in readme.lower() or "First-wins" in readme
+    assert "16384" in readme
     assert "32768" in readme
     assert "65536" in readme
     assert "valid opt-in" in readme
     assert "set the env explicitly to opt in" not in readme
     assert "131072 only if set explicitly" not in readme
     assert "cmtufzqzo0003k004mt2w0m9c" in readme
+    assert "cmtulxq7v0003l2046bhhc3yl" in readme
+    assert "openrouter_key_limit" in readme
     assert "in_flight_budget_exhausted" in readme
     assert "scripts/ecs-in-task.sh" in readme
     assert "--version" in readme

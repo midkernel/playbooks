@@ -61,8 +61,10 @@ DEFAULT_OPENROUTER_MODEL = "moonshotai/kimi-k3"
 OPENROUTER_KEY_PLACEHOLDER = "OVERRIDE_VIA_ENV"
 # Safe per-request generation cap. kimi.bin / OpenRouter otherwise reserve the
 # model catalog (or remaining-context) default of 131072, which 402s typical
-# keys as in_flight_budget_exhausted (run cmtufzqzo0003k004mt2w0m9c).
-DEFAULT_KIMI_MAX_TOKENS = 32768
+# keys as in_flight_budget_exhausted (run cmtufzqzo0003k004mt2w0m9c). 32768
+# still 402s a $10/mo key as openrouter_key_limit (run cmtulxq7v0003l2046bhhc3yl;
+# key afford ~13–25k), so the default is 16384. Lockstep with runner.
+DEFAULT_KIMI_MAX_TOKENS = 16384
 MAX_SAFE_KIMI_MAX_TOKENS = 65536
 UNSAFE_OPENROUTER_MAX_TOKENS = 131072
 # First-wins order matches midkernel/runner (runner#8).
@@ -102,10 +104,12 @@ def clamp_kimi_max_tokens(value: int) -> int:
     """Wallet-safe completion cap. Hard ceiling 65536; 131072 is never opt-in.
 
     ``131072`` is the exact OpenRouter reservation that 402s typical keys
-    (run ``cmtufzqzo0003k004mt2w0m9c``). Values ``>= 131072`` or otherwise
-    above ``65536`` fall back to the ``32768`` default — they do not become
-    a valid override. Config writers stay in lockstep with runner#8
-    (``max_tokens = 32768`` next to ``max_context_size``).
+    (run ``cmtufzqzo0003k004mt2w0m9c``). ``32768`` still 402s a $10/mo key
+    as ``openrouter_key_limit`` (run ``cmtulxq7v0003l2046bhhc3yl``; afford
+    ~13–25k). Values ``>= 131072`` or otherwise above ``65536`` fall back
+    to the ``16384`` default — they do not become a valid override. Config
+    writers stay in lockstep with runner (``max_tokens = 16384`` next to
+    ``max_context_size``).
     """
     if value <= 0:
         return DEFAULT_KIMI_MAX_TOKENS
@@ -123,13 +127,14 @@ class OpenRouterMaxTokensCapError(ValueError):
 def kimi_max_tokens() -> int:
     """Per-request OpenRouter ``max_tokens`` for every Kimi node.
 
-    Default ``32768``. Hard ceiling ``65536``. First-wins env order matches
+    Default ``16384``. Hard ceiling ``65536``. First-wins env order matches
     runner: ``MIDKERNEL_OPENROUTER_MAX_TOKENS``, ``OPENROUTER_MAX_TOKENS``,
     ``KIMI_MAX_TOKENS``, ``KIMI_MODEL_MAX_TOKENS``,
     ``KIMI_MODEL_MAX_COMPLETION_TOKENS``. ``0`` / negative are ignored —
     kimi-cli treats those as “disable clamp”, which restores the 131072
     reservation that 402s typical keys. ``131072`` is **not** a valid opt-in
-    (that is the exact 402 reservation).
+    (that is the exact 402 reservation). ``32768`` is a valid explicit
+    override (under the ceiling) but is no longer the default.
     """
     raw = env_first(*MAX_TOKENS_ENV_NAMES, default=str(DEFAULT_KIMI_MAX_TOKENS))
     try:
@@ -283,8 +288,10 @@ class OpenRouterMaxTokensProxy:
     OpenRouter actually receives, so wrap_kimi must clamp that body.
     """
 
-    def __init__(self, cap: int, *, upstream_base: str = OPENROUTER_BASE_URL) -> None:
-        self.cap = clamp_kimi_max_tokens(int(cap))
+    def __init__(self, cap: int | None = None, *, upstream_base: str = OPENROUTER_BASE_URL) -> None:
+        self.cap = clamp_kimi_max_tokens(
+            DEFAULT_KIMI_MAX_TOKENS if cap is None else int(cap)
+        )
         self.upstream_base = upstream_base.rstrip("/")
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -1210,7 +1217,9 @@ def render_kimi_openrouter_config(
             "max_context_size = 262144",
             # Completion budget only. Never copy max_context_size here —
             # OpenRouter 402 in_flight_budget_exhausted on 131072
-            # (GOAL cmtufzqzo0003k004mt2w0m9c). Lockstep with runner#8.
+            # (GOAL cmtufzqzo0003k004mt2w0m9c). 32768 still 402s as
+            # openrouter_key_limit (cmtulxq7v0003l2046bhhc3yl). Lockstep
+            # with runner: default max_tokens = 16384.
             f"max_tokens = {cap}",
             f"max_output_size = {cap}",
             "",

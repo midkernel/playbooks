@@ -54,8 +54,8 @@ def test_kimi_config_is_openrouter_legacy() -> None:
     assert "openrouter.ai/api/v1" in config
     assert "moonshotai/kimi-k3" in config
     assert "bedrock" not in config.lower()
-    assert "max_tokens = 32768" in config
-    assert "max_output_size = 32768" in config
+    assert "max_tokens = 16384" in config
+    assert "max_output_size = 16384" in config
     assert "131072" not in config
 
 
@@ -69,34 +69,38 @@ def test_kimi_max_tokens_default_and_env(monkeypatch: pytest.MonkeyPatch) -> Non
         "KIMI_MODEL_MAX_TOKENS",
         "KIMI_MODEL_MAX_COMPLETION_TOKENS",
     )
-    assert mk.kimi_max_tokens() == mk.DEFAULT_KIMI_MAX_TOKENS == 32768
+    assert mk.kimi_max_tokens() == mk.DEFAULT_KIMI_MAX_TOKENS == 16384
     assert mk.MAX_SAFE_KIMI_MAX_TOKENS == 65536
     assert mk.UNSAFE_OPENROUTER_MAX_TOKENS == 131072
     monkeypatch.setenv("KIMI_MAX_TOKENS", "0")
-    assert mk.kimi_max_tokens() == 32768
+    assert mk.kimi_max_tokens() == 16384
     monkeypatch.setenv("KIMI_MAX_TOKENS", "-1")
-    assert mk.kimi_max_tokens() == 32768
+    assert mk.kimi_max_tokens() == 16384
     monkeypatch.setenv("KIMI_MAX_TOKENS", "nope")
-    assert mk.kimi_max_tokens() == 32768
+    assert mk.kimi_max_tokens() == 16384
     monkeypatch.setenv("OPENROUTER_MAX_TOKENS", "65536")
     monkeypatch.delenv("KIMI_MAX_TOKENS", raising=False)
     assert mk.kimi_max_tokens() == 65536
     monkeypatch.setenv("MIDKERNEL_OPENROUTER_MAX_TOKENS", "65536")
     monkeypatch.delenv("OPENROUTER_MAX_TOKENS", raising=False)
     assert mk.kimi_max_tokens() == 65536
+    # 32768 remains a valid explicit override (under the hard ceiling).
+    monkeypatch.setenv("MIDKERNEL_OPENROUTER_MAX_TOKENS", "32768")
+    assert mk.kimi_max_tokens() == 32768
     # 131072 is the exact 402 reservation — not a valid opt-in.
     # Clear higher-priority aliases so KIMI_MAX_TOKENS is the first-wins source.
     for name in mk.MAX_TOKENS_ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("KIMI_MAX_TOKENS", "131072")
-    assert mk.kimi_max_tokens() == 32768
+    assert mk.kimi_max_tokens() == 16384
     monkeypatch.setenv("KIMI_MAX_TOKENS", "80000")
-    assert mk.kimi_max_tokens() == 32768
+    assert mk.kimi_max_tokens() == 16384
     monkeypatch.setenv("KIMI_MAX_TOKENS", "65536")
     assert mk.kimi_max_tokens() == 65536
-    assert mk.clamp_kimi_max_tokens(131072) == 32768
-    assert mk.clamp_kimi_max_tokens(65537) == 32768
+    assert mk.clamp_kimi_max_tokens(131072) == 16384
+    assert mk.clamp_kimi_max_tokens(65537) == 16384
     assert mk.clamp_kimi_max_tokens(65536) == 65536
+    assert mk.clamp_kimi_max_tokens(32768) == 32768
 
 
 def test_kimi_max_tokens_env_first_wins_matches_runner(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -138,11 +142,11 @@ def test_openrouter_node_env_passthrough(monkeypatch: pytest.MonkeyPatch, tmp_pa
     assert env["OPENAI_BASE_URL"] == mk.OPENROUTER_BASE_URL
     assert env["HOME"] == str(tmp_path / "agent")
     assert env["KIMI_SHARE_DIR"] == str(tmp_path / ".midkernel" / "kimi")
-    assert env["KIMI_MAX_TOKENS"] == "32768"
-    assert env["OPENROUTER_MAX_TOKENS"] == "32768"
-    assert env["MIDKERNEL_OPENROUTER_MAX_TOKENS"] == "32768"
-    assert env["KIMI_MODEL_MAX_TOKENS"] == "32768"
-    assert env["KIMI_MODEL_MAX_COMPLETION_TOKENS"] == "32768"
+    assert env["KIMI_MAX_TOKENS"] == "16384"
+    assert env["OPENROUTER_MAX_TOKENS"] == "16384"
+    assert env["MIDKERNEL_OPENROUTER_MAX_TOKENS"] == "16384"
+    assert env["KIMI_MODEL_MAX_TOKENS"] == "16384"
+    assert env["KIMI_MODEL_MAX_COMPLETION_TOKENS"] == "16384"
 
 
 def test_target_mode_local(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -185,7 +189,7 @@ def test_prepare_script_bakes_playbook_defaults() -> None:
         "${KIMI_MAX_TOKENS:-${KIMI_MODEL_MAX_TOKENS:-"
         "${KIMI_MODEL_MAX_COMPLETION_TOKENS:-"
     ) in security
-    assert "32768" in security
+    assert "16384" in security
     assert "max_tokens = 131072" not in security
     assert "max_output_size = 131072" not in security
     assert "-gt 65536" in security
@@ -265,9 +269,9 @@ def test_build_scan_graph_unchanged_shape(monkeypatch: pytest.MonkeyPatch) -> No
     ).resolve()
     assert nodes["review"]["env"]["MIDKERNEL_NODE_ID"] == "review"
     assert nodes["review"]["env"]["MIDKERNEL_KIMI_BIN"]
-    assert nodes["review"]["env"]["KIMI_MAX_TOKENS"] == "32768"
-    assert nodes["review"]["env"]["OPENROUTER_MAX_TOKENS"] == "32768"
-    assert nodes["review"]["env"]["MIDKERNEL_OPENROUTER_MAX_TOKENS"] == "32768"
+    assert nodes["review"]["env"]["KIMI_MAX_TOKENS"] == "16384"
+    assert nodes["review"]["env"]["OPENROUTER_MAX_TOKENS"] == "16384"
+    assert nodes["review"]["env"]["MIDKERNEL_OPENROUTER_MAX_TOKENS"] == "16384"
     assert nodes["prepare"]["env"]["BASH_ENV"] == "/dev/null"
     assert nodes["publish"]["env"]["MIDKERNEL_NODE_READY"] == "1"
     assert "python3" in nodes["prepare"]["prompt"]

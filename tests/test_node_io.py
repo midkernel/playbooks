@@ -434,11 +434,11 @@ def test_kimi_io_env_passes_openrouter_keys(monkeypatch: pytest.MonkeyPatch, tmp
     assert env["HOME"] == str(tmp_path / "home")
     assert env["OPENROUTER_MODEL"] == "anthropic/claude-sonnet-4.5"
     assert env["KIMI_SHARE_DIR"] == str(tmp_path / ".midkernel" / "kimi")
-    assert env["KIMI_MAX_TOKENS"] == "32768"
-    assert env["OPENROUTER_MAX_TOKENS"] == "32768"
-    assert env["MIDKERNEL_OPENROUTER_MAX_TOKENS"] == "32768"
-    assert env["KIMI_MODEL_MAX_TOKENS"] == "32768"
-    assert env["KIMI_MODEL_MAX_COMPLETION_TOKENS"] == "32768"
+    assert env["KIMI_MAX_TOKENS"] == "16384"
+    assert env["OPENROUTER_MAX_TOKENS"] == "16384"
+    assert env["MIDKERNEL_OPENROUTER_MAX_TOKENS"] == "16384"
+    assert env["KIMI_MODEL_MAX_TOKENS"] == "16384"
+    assert env["KIMI_MODEL_MAX_COMPLETION_TOKENS"] == "16384"
 
 
 def test_ensure_kimi_config_rewrites_inline_toml(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -457,8 +457,8 @@ def test_ensure_kimi_config_rewrites_inline_toml(tmp_path: Path, monkeypatch: py
     assert "openai_legacy" in text
     assert "sk-or-live" in text
     assert "moonshotai/kimi-k3" in text
-    assert "max_tokens = 32768" in text
-    assert "max_output_size = 32768" in text
+    assert "max_tokens = 16384" in text
+    assert "max_output_size = 16384" in text
     assert "131072" not in text
 
 
@@ -509,37 +509,37 @@ def test_utc_now_is_zulu() -> None:
 def test_cap_openrouter_payload_never_leaves_131072() -> None:
     cap = io.DEFAULT_KIMI_MAX_TOKENS
     injected = io.cap_openrouter_payload({"model": "moonshotai/kimi-k3"}, cap)
-    assert injected["max_tokens"] == 32768
+    assert injected["max_tokens"] == 16384
     clamped = io.cap_openrouter_payload(
         {"max_tokens": io.UNSAFE_OPENROUTER_MAX_TOKENS, "max_completion_tokens": 200000},
         cap,
     )
-    assert clamped["max_tokens"] == 32768
-    assert clamped["max_completion_tokens"] == 32768
+    assert clamped["max_tokens"] == 16384
+    assert clamped["max_completion_tokens"] == 16384
     kept = io.cap_openrouter_payload({"max_tokens": 1024}, cap)
     assert kept["max_tokens"] == 1024
     zeroed = io.cap_openrouter_payload({"max_tokens": 0}, cap)
-    assert zeroed["max_tokens"] == 32768
-    # A caller-supplied cap of 131072 is itself unsafe and becomes 32768.
+    assert zeroed["max_tokens"] == 16384
+    # A caller-supplied cap of 131072 is itself unsafe and becomes 16384.
     unsafe_cap = io.cap_openrouter_payload({"max_tokens": 131072}, 131072)
-    assert unsafe_cap["max_tokens"] == 32768
+    assert unsafe_cap["max_tokens"] == 16384
 
 
 def test_cap_openrouter_request_body_empty_or_non_json_never_passthrough() -> None:
     cap = io.DEFAULT_KIMI_MAX_TOKENS
     empty = json.loads(io.cap_openrouter_request_body(b"", cap).decode("utf-8"))
-    assert empty == {"max_tokens": 32768}
+    assert empty == {"max_tokens": 16384}
     whitespace = json.loads(io.cap_openrouter_request_body(b"  \n", cap).decode("utf-8"))
-    assert whitespace == {"max_tokens": 32768}
+    assert whitespace == {"max_tokens": 16384}
     missing = json.loads(
         io.cap_openrouter_request_body(b'{"model":"moonshotai/kimi-k3"}', cap).decode("utf-8")
     )
-    assert missing["max_tokens"] == 32768
+    assert missing["max_tokens"] == 16384
     assert missing["model"] == "moonshotai/kimi-k3"
     rewritten = json.loads(
         io.cap_openrouter_request_body(b'{"max_tokens":131072}', cap).decode("utf-8")
     )
-    assert rewritten["max_tokens"] == 32768
+    assert rewritten["max_tokens"] == 16384
     with pytest.raises(io.OpenRouterMaxTokensCapError):
         io.cap_openrouter_request_body(b"not-json", cap)
     with pytest.raises(io.OpenRouterMaxTokensCapError):
@@ -555,12 +555,17 @@ def test_read_http_request_body_missing_content_length_is_empty() -> None:
 
 
 def test_render_kimi_config_writes_max_tokens_and_rejects_131072() -> None:
-    text = io.render_kimi_openrouter_config("moonshotai/kimi-k3", max_tokens=32768)
-    assert "max_tokens = 32768" in text
-    assert "max_output_size = 32768" in text
+    text = io.render_kimi_openrouter_config("moonshotai/kimi-k3", max_tokens=16384)
+    assert "max_tokens = 16384" in text
+    assert "max_output_size = 16384" in text
     assert "131072" not in text
+    defaulted = io.render_kimi_openrouter_config("moonshotai/kimi-k3")
+    assert "max_tokens = 16384" in defaulted
+    # 32768 remains a valid explicit override under the hard ceiling.
+    kept = io.render_kimi_openrouter_config("moonshotai/kimi-k3", max_tokens=32768)
+    assert "max_tokens = 32768" in kept
     rejected = io.render_kimi_openrouter_config("moonshotai/kimi-k3", max_tokens=131072)
-    assert "max_tokens = 32768" in rejected
+    assert "max_tokens = 16384" in rejected
     assert "max_tokens = 131072" not in rejected
     ceiling = io.render_kimi_openrouter_config("moonshotai/kimi-k3", max_tokens=65536)
     assert "max_tokens = 65536" in ceiling
@@ -593,7 +598,7 @@ def _openrouter_proxy_harness() -> Iterator[tuple[str, dict[str, object]]]:
     try:
         _host, port = upstream.server_address
         proxy = io.OpenRouterMaxTokensProxy(
-            32768, upstream_base=f"http://127.0.0.1:{int(port)}/api/v1"
+            upstream_base=f"http://127.0.0.1:{int(port)}/api/v1"
         )
         base = proxy.start()
         try:
@@ -615,7 +620,7 @@ def test_openrouter_proxy_injects_max_tokens() -> None:
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
             assert resp.status == 200
-        assert received["body"]["max_tokens"] == 32768
+        assert received["body"]["max_tokens"] == 16384
         assert received["path"].endswith("/chat/completions")
 
 
@@ -629,7 +634,7 @@ def test_openrouter_proxy_injects_missing_max_tokens() -> None:
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
             assert resp.status == 200
-        assert received["body"]["max_tokens"] == 32768
+        assert received["body"]["max_tokens"] == 16384
         assert received["body"]["model"] == "moonshotai/kimi-k3"
 
 
@@ -643,7 +648,7 @@ def test_openrouter_proxy_injects_empty_body() -> None:
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
             assert resp.status == 200
-        assert received["body"] == {"max_tokens": 32768}
+        assert received["body"] == {"max_tokens": 16384}
 
 
 def test_openrouter_proxy_injects_missing_content_length() -> None:
@@ -659,7 +664,7 @@ def test_openrouter_proxy_injects_missing_content_length() -> None:
             resp.read()
         finally:
             conn.close()
-        assert received["body"] == {"max_tokens": 32768}
+        assert received["body"] == {"max_tokens": 16384}
 
 
 def test_openrouter_proxy_rejects_non_json_chat_completions() -> None:
@@ -725,7 +730,7 @@ def test_wrap_kimi_uploads_result_when_model_writes_it(
     assert "clean miss" in output
     assert "invent" not in output.lower()
     config = (tmp_path / ".midkernel" / "kimi" / "config.toml").read_text(encoding="utf-8")
-    assert "max_tokens = 32768" in config
+    assert "max_tokens = 16384" in config
     assert "max_tokens = 131072" not in config
 
 
@@ -745,5 +750,5 @@ def test_wrap_kimi_rejects_131072_env_in_written_config(
     monkeypatch.setenv("KIMI_MAX_TOKENS", "131072")
     assert io.main(["-p", "hunt"]) == 0
     config = (tmp_path / ".midkernel" / "kimi" / "config.toml").read_text(encoding="utf-8")
-    assert "max_tokens = 32768" in config
+    assert "max_tokens = 16384" in config
     assert "max_tokens = 131072" not in config
