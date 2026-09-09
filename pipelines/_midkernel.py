@@ -401,7 +401,7 @@ esac
 case "$KIMI_MAX_TOKENS" in
   ''|*[!0-9]*|0) KIMI_MAX_TOKENS="__KIMI_MAX_TOKENS__" ;;
 esac
-# Values >=131072 or otherwise above 65536 become the 32768 default.
+# Values >=131072 or otherwise above 65536 become the 16384 default.
 if [ "$KIMI_MAX_TOKENS" -gt 65536 ] 2>/dev/null; then
   KIMI_MAX_TOKENS="__KIMI_MAX_TOKENS__"
 fi
