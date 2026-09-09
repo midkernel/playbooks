@@ -140,6 +140,80 @@ def test_spawn_hunters_are_first_class_dynamic(io_home: Path) -> None:
     assert len([n for n in again["nodes"] if n["id"].startswith("hunter-")]) == 3
 
 
+def test_hunter_graph_predecessor_is_serialized_not_parent() -> None:
+    """parentId is surface-split; the execution edge is the hunter chain."""
+    assert io.hunter_graph_predecessor("hunter-1") == "surface-split"
+    assert io.hunter_graph_predecessor("hunter-2") == "hunter-1"
+    assert io.hunter_graph_predecessor("hunter-6") == "hunter-5"
+    assert io.hunter_graph_predecessor("judge-a") is None
+    assert io.hunter_graph_predecessor("review") is None
+
+
+def test_start_node_hunter_2_does_not_write_surface_split_edge(
+    io_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live path: start_node(hunter-2) must not reintroduce fan-out.
+
+    parentId / MIDKERNEL_NODE_PARENT stay surface-split (UI grouping).
+    Reviewer 3 REQUEST_CHANGES on PR #12: update_node used to upsert
+    parentId → hunter-N on every start/finish.
+    """
+    monkeypatch.setenv("MIDKERNEL_NODE_PARENT", "surface-split")
+    monkeypatch.setenv("MIDKERNEL_NODE_DYNAMIC", "1")
+    io.init_graph(
+        [
+            io.graph_node_record("surface-split", kind="kimi"),
+            io.graph_node_record("judge-a", kind="kimi"),
+        ],
+        [{"source": "surface-split", "target": "judge-a"}],
+    )
+    io.spawn_hunters(3)
+    io.start_node("hunter-1", kind="kimi", parent_id="surface-split", dynamic=True)
+    io.start_node("hunter-2", kind="kimi", parent_id="surface-split", dynamic=True)
+    graph = _read_json(io_home, "runs/run-test/graph.json")
+    pairs = {(edge["source"], edge["target"]) for edge in graph["edges"]}
+    assert ("surface-split", "hunter-1") in pairs
+    assert ("surface-split", "hunter-2") not in pairs
+    assert ("surface-split", "hunter-3") not in pairs
+    assert ("hunter-1", "hunter-2") in pairs
+    assert ("hunter-2", "judge-a") in pairs
+    hunter2 = next(node for node in graph["nodes"] if node["id"] == "hunter-2")
+    assert hunter2["parentId"] == "surface-split"
+    assert hunter2["status"] == "running"
+    io.finish_node("hunter-2", status="completed", output_text="ok")
+    graph = _read_json(io_home, "runs/run-test/graph.json")
+    pairs = {(edge["source"], edge["target"]) for edge in graph["edges"]}
+    assert ("surface-split", "hunter-2") not in pairs
+    assert ("hunter-1", "hunter-2") in pairs
+
+
+def test_update_node_drops_leftover_surface_split_fanout(io_home: Path) -> None:
+    """If an old fan-out edge exists, start/finish must drop it."""
+    io.init_graph(
+        [
+            io.graph_node_record("surface-split", kind="kimi"),
+            io.graph_node_record("judge-a", kind="kimi"),
+        ],
+        [
+            {"source": "surface-split", "target": "hunter-2"},
+            {"source": "hunter-1", "target": "hunter-2"},
+            {"source": "hunter-2", "target": "judge-a"},
+        ],
+    )
+    io.update_node(
+        "hunter-2",
+        kind="kimi",
+        status="running",
+        parentId="surface-split",
+        dynamic=True,
+    )
+    graph = _read_json(io_home, "runs/run-test/graph.json")
+    pairs = {(edge["source"], edge["target"]) for edge in graph["edges"]}
+    assert ("surface-split", "hunter-2") not in pairs
+    assert ("hunter-1", "hunter-2") in pairs
+    assert ("hunter-2", "judge-a") in pairs
+
+
 def test_surface_split_finish_spawns_hunters(io_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GOAL_COUNT", "2")
     io.init_graph(
@@ -775,28 +849,34 @@ def test_parse_retry_after_seconds_and_http_date() -> None:
 
 def test_openrouter_429_delay_prefers_retry_after_then_backoff() -> None:
     assert io.openrouter_429_delay_seconds(0, "5") == 5.0
+    # 20 RPM window is 60s; do not clamp Retry-After to the old 32s cap.
+    assert io.openrouter_429_delay_seconds(0, "60") == 60.0
+    assert io.openrouter_429_delay_seconds(0, "90") == 90.0
     assert io.openrouter_429_delay_seconds(0, "999") == io.OPENROUTER_429_BACKOFF_CAP_SECONDS
+    assert io.OPENROUTER_429_BACKOFF_CAP_SECONDS == 90.0
     assert io.openrouter_429_delay_seconds(0, None) == 1.0
     assert io.openrouter_429_delay_seconds(1, None) == 2.0
     assert io.openrouter_429_delay_seconds(2, None) == 4.0
     assert io.openrouter_429_delay_seconds(3, None) == 8.0
+    assert io.openrouter_429_delay_seconds(6, None) == 64.0
+    assert io.openrouter_429_delay_seconds(7, None) == io.OPENROUTER_429_BACKOFF_CAP_SECONDS
     assert io.openrouter_429_delay_seconds(10, None) == io.OPENROUTER_429_BACKOFF_CAP_SECONDS
-    assert io.should_retry_openrouter(429, 0, 4) is True
-    assert io.should_retry_openrouter(429, 3, 4) is True
-    assert io.should_retry_openrouter(429, 4, 4) is False
-    assert io.should_retry_openrouter(402, 0, 4) is False
-    assert io.should_retry_openrouter(500, 0, 4) is False
+    assert io.should_retry_openrouter(429, 0, 8) is True
+    assert io.should_retry_openrouter(429, 7, 8) is True
+    assert io.should_retry_openrouter(429, 8, 8) is False
+    assert io.should_retry_openrouter(402, 0, 8) is False
+    assert io.should_retry_openrouter(500, 0, 8) is False
 
 
 def test_openrouter_429_retries_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MIDKERNEL_OPENROUTER_429_RETRIES", raising=False)
-    assert io.openrouter_429_retries() == 4
+    assert io.openrouter_429_retries() == 8
     monkeypatch.setenv("MIDKERNEL_OPENROUTER_429_RETRIES", "2")
     assert io.openrouter_429_retries() == 2
     monkeypatch.setenv("MIDKERNEL_OPENROUTER_429_RETRIES", "99")
     assert io.openrouter_429_retries() == io.MAX_OPENROUTER_429_RETRIES
     monkeypatch.setenv("MIDKERNEL_OPENROUTER_429_RETRIES", "nope")
-    assert io.openrouter_429_retries() == 4
+    assert io.openrouter_429_retries() == 8
 
 
 @contextmanager
@@ -845,6 +925,29 @@ def _openrouter_scripted_proxy(
     finally:
         upstream.shutdown()
         upstream.server_close()
+
+
+def test_openrouter_proxy_honors_retry_after_60s_rpm_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """New-account 20 RPM is a 60s window; do not clamp Retry-After to 32s."""
+    slept: list[float] = []
+    monkeypatch.setattr(io, "_sleep", slept.append)
+    script = [
+        {"status": 429, "retry_after": "60", "body": b'{"error":"rate"}'},
+        {"status": 200, "body": b'{"id":"ok"}'},
+    ]
+    with _openrouter_scripted_proxy(script) as (base, hits):
+        req = urllib.request.Request(
+            f"{base}/chat/completions",
+            data=json.dumps({"model": "moonshotai/kimi-k3"}).encode(),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            assert resp.status == 200
+        assert hits["n"] == 2
+        assert slept == [60.0]
 
 
 def test_openrouter_proxy_retries_429_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:

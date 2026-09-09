@@ -92,3 +92,5 @@ def test_readme_documents_openrouter_lock_and_default_targets() -> None:
     assert "20 requests/minute" in readme
     assert "429" in readme
     assert "serialized" in readme.lower() or "depends_on" in readme
+    assert "90s" in readme
+    assert "hunter-2..N never regain" in readme or "never regain a `surface-split` edge" in readme

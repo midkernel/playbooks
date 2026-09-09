@@ -17,7 +17,9 @@ Progress is ``{completed, total, percent, etaSeconds}``. Dynamic hunters
 ``graph.json`` when the graph is initialized and again when ``surface-split``
 finishes (idempotent), with a serialized chain
 ``surface-split → hunter-1 → hunter-2 → … → hunter-N`` and each hunter also
-edging to ``judge-a``. Parallel fan-out is the 429 root cause
+edging to ``judge-a``. ``update_node`` / ``start_node`` must keep that chain:
+``parentId`` stays ``surface-split`` for UI grouping, but hunter-2..N never
+regain a ``surface-split`` edge. Parallel fan-out is the 429 root cause
 (run ``cmtun51000003l704q7lyyjrf``).
 
 This module is stdlib + optional ``boto3``. The helper is copied onto the
@@ -83,10 +85,12 @@ MAX_TOKENS_ENV_NAMES = (
 # Defense in depth for OpenRouter 429 RPM (new-account 20 req/min on
 # moonshotai/kimi-k3, run cmtun51000003l704q7lyyjrf). Serialization of GOAL
 # hunters is the primary fix; these retries cover a transient in-node burst.
-DEFAULT_OPENROUTER_429_RETRIES = 4
-MAX_OPENROUTER_429_RETRIES = 8
+# A 20 RPM window is 60s — honor Retry-After through 90s and keep enough
+# attempts that exponential backoff can wait out that window. Never retry 402.
+DEFAULT_OPENROUTER_429_RETRIES = 8
+MAX_OPENROUTER_429_RETRIES = 16
 OPENROUTER_429_BACKOFF_BASE_SECONDS = 1.0
-OPENROUTER_429_BACKOFF_CAP_SECONDS = 32.0
+OPENROUTER_429_BACKOFF_CAP_SECONDS = 90.0
 NODE_STATUSES = ("pending", "running", "completed", "failed")
 SAFE_NODE_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 SAFE_RUN_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
@@ -350,9 +354,10 @@ class OpenRouterMaxTokensProxy:
     to the native Kimi / Anthropic providers. The 402 is on the HTTP body
     OpenRouter actually receives, so wrap_kimi must clamp that body.
 
-    429 responses are retried (Retry-After or exponential backoff) so a
-    transient RPM hit does not hard-fail the node. Serialization of GOAL
-    hunters is the primary 429 fix; this is defense in depth.
+    429 responses are retried (Retry-After through 90s, or exponential
+    backoff; default 8 attempts) so an in-node kimi burst can wait out a
+    20 RPM (60s) window. Serialization of GOAL hunters is the primary 429
+    fix; this is defense in depth. 402 is never retried.
     """
 
     def __init__(
@@ -706,6 +711,22 @@ def hunter_index(node_id: str) -> int | None:
         return None
 
 
+def hunter_graph_predecessor(node_id: str, *, source: str = "surface-split") -> str | None:
+    """Serialized predecessor for hunter-N edges in ``graph.json``.
+
+    ``hunter-1`` depends on *source* (``surface-split``). ``hunter-k`` depends
+    on ``hunter-(k-1)``. Never ``surface-split → hunter-2..N`` — that fan-out
+    is the 429 (run ``cmtun51000003l704q7lyyjrf``). ``parentId`` stays
+    ``surface-split`` for UI grouping; it is not the execution edge.
+    """
+    index = hunter_index(node_id)
+    if index is None:
+        return None
+    if index <= 1:
+        return source
+    return f"hunter-{index - 1}"
+
+
 def content_type_for_key(key: str) -> str:
     if key.endswith(".json"):
         return "application/json"
@@ -875,6 +896,46 @@ def _upsert_edge(graph: dict[str, Any], source: str, target: str) -> None:
     graph["edges"] = edges
 
 
+def _drop_edge(graph: dict[str, Any], source: str, target: str) -> None:
+    """Remove a source→target edge if present (fan-out cleanup)."""
+    source = safe_node_id(source)
+    target = safe_node_id(target)
+    edge_id = f"e-{source}-{target}"
+    graph["edges"] = [
+        edge
+        for edge in list(graph.get("edges") or [])
+        if not (
+            edge.get("id") == edge_id
+            or (edge.get("source") == source and edge.get("target") == target)
+        )
+    ]
+
+
+def _upsert_dynamic_hunter_edges(
+    graph: dict[str, Any],
+    node_id: str,
+    *,
+    parent_id: str | None = None,
+    target: str = "judge-a",
+) -> None:
+    """Keep hunter-2..N on the serialized chain, never parentId fan-out.
+
+    ``update_node`` used to ``_upsert_edge(parentId or surface-split, hunter-N)``
+    on every start/finish. ``parentId`` is always ``surface-split``, so that
+    reintroduced ``surface-split → hunter-2..N`` after ``spawn_hunters``.
+    """
+    source = parent_id or "surface-split"
+    predecessor = hunter_graph_predecessor(node_id, source=source)
+    if predecessor is None:
+        _upsert_edge(graph, source, node_id)
+        _upsert_edge(graph, node_id, target)
+        return
+    _upsert_edge(graph, predecessor, node_id)
+    _upsert_edge(graph, node_id, target)
+    if predecessor != source:
+        _drop_edge(graph, source, node_id)
+
+
 def graph_node_record(
     node_id: str,
     *,
@@ -990,6 +1051,8 @@ def spawn_hunters(
             _upsert_node(graph, record)
             _upsert_edge(graph, predecessor, nid)
             _upsert_edge(graph, nid, target)
+            if predecessor != source:
+                _drop_edge(graph, source, nid)
             predecessor = nid
         return save_graph(graph)
     finally:
@@ -1031,9 +1094,13 @@ def update_node(node_id: str, **fields: Any) -> dict[str, Any]:
         record["artifacts"] = node_artifact_keys(node_id)
         _upsert_node(graph, record)
         if record.get("dynamic") or is_dynamic_node(node_id):
-            parent = record.get("parentId") or "surface-split"
-            _upsert_edge(graph, parent, node_id)
-            _upsert_edge(graph, node_id, "judge-a")
+            # parentId stays surface-split for UI grouping. Do not upsert that
+            # as the execution edge — hunter-2..N would regain fan-out.
+            _upsert_dynamic_hunter_edges(
+                graph,
+                node_id,
+                parent_id=record.get("parentId"),
+            )
         save_graph(graph)
         return record
     finally:
