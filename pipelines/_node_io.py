@@ -88,6 +88,18 @@ def workdir_is_writable() -> bool:
         return False
 
 
+def node_io_flag() -> str:
+    return env_first("MIDKERNEL_NODE_IO").lower()
+
+
+def node_io_requested() -> bool:
+    """True when a live run asked for I/O (flag on, or RUN_ID set)."""
+    flag = node_io_flag()
+    if flag in {"0", "false", "no", "off"}:
+        return False
+    return flag in {"1", "true", "yes", "on"} or bool(run_id())
+
+
 def node_io_enabled() -> bool:
     """Whether per-node I/O may touch disk or S3.
 
@@ -96,11 +108,37 @@ def node_io_enabled() -> bool:
     ``MIDKERNEL_NODE_IO=0`` disables writes. Graph emit and CI validate
     must stay side-effect free — this never creates ``/workspace``.
     """
-    flag = env_first("MIDKERNEL_NODE_IO").lower()
+    return node_io_requested() and workdir_is_writable()
+
+
+def node_io_disabled_reason() -> str | None:
+    """Why I/O is off, or ``None`` when enabled. Used for fail-visible logs."""
+    if node_io_enabled():
+        return None
+    flag = node_io_flag()
     if flag in {"0", "false", "no", "off"}:
-        return False
-    requested = flag in {"1", "true", "yes", "on"} or bool(run_id())
-    return requested and workdir_is_writable()
+        return "MIDKERNEL_NODE_IO=off"
+    if not node_io_requested():
+        return "no_run_id_or_flag"
+    path = workdir()
+    if not Path(path).is_dir():
+        return f"WORKDIR_missing:{path}"
+    if not os.access(path, os.W_OK):
+        return f"WORKDIR_not_writable:{path}"
+    return "disabled"
+
+
+def log_node_io_gate(context: str) -> None:
+    """Print why I/O is off when a run was requested. Silent in CI validate."""
+    reason = node_io_disabled_reason()
+    if reason is None or reason == "no_run_id_or_flag":
+        return
+    print(
+        f"node io: disabled during {context} ({reason}) "
+        f"WORKDIR={workdir()!r} RUN_ID_set={bool(run_id())} "
+        f"MIDKERNEL_NODE_IO={env_first('MIDKERNEL_NODE_IO')!r}",
+        file=sys.stderr,
+    )
 
 
 def repo_dir() -> str:
@@ -117,6 +155,23 @@ def runtime_dir() -> Path:
 
 def runtime_script_path() -> Path:
     return runtime_dir() / "node_io.py"
+
+
+def source_script_path() -> Path:
+    """This file, next to the playbooks graph (exists at in-task emit)."""
+    return Path(__file__).resolve()
+
+
+def kimi_executable() -> str:
+    """Absolute path agentflow should exec for Kimi nodes.
+
+    Always this playbooks ``_node_io.py`` (present when ``agentflow run
+    pipelines/<slug>.py`` emits in-task). Do **not** point at
+    ``$WORKDIR/.midkernel/node_io.py`` only — emit-time ``install_runtime``
+    is a no-op when WORKDIR is missing, which left Kimi nodes executing a
+    path that did not exist (PATH ``kimi`` then ran with no per-node I/O).
+    """
+    return str(source_script_path())
 
 
 def local_state_path() -> Path:
@@ -263,12 +318,18 @@ def skip_s3() -> bool:
 def put_bytes(key: str, body: bytes, *, content_type: str | None = None) -> None:
     """Write a local mirror always; PutObject when RUN_ID is set."""
     if not node_io_enabled():
+        log_node_io_gate(f"put {key}")
         return
     ctype = content_type or content_type_for_key(key)
     mirror = artifacts_mirror_dir() / key
     mirror.parent.mkdir(parents=True, exist_ok=True)
     mirror.write_bytes(body)
     if skip_s3():
+        if env_first("MIDKERNEL_IO_SKIP_S3") != "1" and not run_id():
+            print(
+                f"node io: skipped s3://{artifacts_bucket()}/{key} (RUN_ID unset; local mirror only)",
+                file=sys.stderr,
+            )
         return
     try:
         import boto3
@@ -636,6 +697,7 @@ def start_node(
 ) -> dict[str, Any]:
     nid = safe_node_id(node_id)
     if not node_io_enabled():
+        log_node_io_gate(f"start {nid}")
         return {}
     started = utc_now()
     if prompt is not None:
@@ -678,6 +740,7 @@ def finish_node(
 ) -> dict[str, Any]:
     nid = safe_node_id(node_id)
     if not node_io_enabled():
+        log_node_io_gate(f"finish {nid}")
         return {}
     if status not in {"completed", "failed"}:
         status = "failed"
@@ -717,6 +780,7 @@ def finish_node(
 def install_runtime() -> Path | None:
     dest = runtime_script_path()
     if not node_io_enabled():
+        log_node_io_gate("install_runtime")
         return None
     dest.parent.mkdir(parents=True, exist_ok=True)
     source = Path(__file__).read_text(encoding="utf-8")
@@ -732,6 +796,7 @@ def bootstrap_run_io(payload: dict[str, Any]) -> dict[str, Any]:
     ``agentflow validate`` stay side-effect free.
     """
     if not node_io_enabled():
+        log_node_io_gate("bootstrap_run_io")
         return _empty_graph()
     install_runtime()
     nodes, edges = graph_from_pipeline(payload)
@@ -764,10 +829,16 @@ def wrap_shell_script(
     dyn = "1" if (is_dynamic_node(nid) if dynamic is None else dynamic) else ""
     parent = parent_id or ("surface-split" if is_dynamic_node(nid) else "")
     prompt_b64 = base64.b64encode(script.encode("utf-8")).decode("ascii")
-    helper_src = str(Path(__file__).resolve())
+    helper_src = str(source_script_path())
     return f"""
 set -euo pipefail
-WORKDIR="${{WORKDIR:-/workspace}}"
+# Shared-disk contract: WORKDIR must match the task volume (image default /workspace).
+export WORKDIR="${{WORKDIR:-/workspace}}"
+export OUTPUTS_DIR="${{OUTPUTS_DIR:-/outputs}}"
+# Create the shared disk *before* the I/O gate. Prepare used to mkdir only
+# inside the inner script, so the wrap saw a missing WORKDIR and skipped
+# helper install for the whole node (and left Kimi executable missing).
+mkdir -p "$WORKDIR" "$OUTPUTS_DIR" "$WORKDIR/.midkernel" || true
 IO_DIR="$WORKDIR/.midkernel"
 IO="$IO_DIR/node_io.py"
 NODE_ID={_bash_single(nid)}
@@ -780,15 +851,12 @@ export MIDKERNEL_NODE_PARENT={_bash_single(parent)}
 export MIDKERNEL_NODE_DYNAMIC={_bash_single(dyn)}
 LOG="/dev/null"
 PROMPT_FILE=""
-# Disk / S3 I/O only on a real run (writable WORKDIR + RUN_ID or MIDKERNEL_NODE_IO=1).
-NODE_IO=0
+# Disk / S3 I/O after mkdir unless explicitly off (CI / MIDKERNEL_NODE_IO=0).
+NODE_IO=1
 case "${{MIDKERNEL_NODE_IO:-}}" in
   0|false|no|off|FALSE|NO|OFF) NODE_IO=0 ;;
-  1|true|yes|on|TRUE|YES|ON) NODE_IO=1 ;;
-  *)
-    if [ -n "${{RUN_ID:-}}" ]; then NODE_IO=1; fi
-    ;;
 esac
+export MIDKERNEL_NODE_IO="${{MIDKERNEL_NODE_IO:-1}}"
 if [ "$NODE_IO" = "1" ] && [ -d "$WORKDIR" ] && [ -w "$WORKDIR" ]; then
   export MIDKERNEL_NODE_IO=1
   mkdir -p "$IO_DIR/nodes/$NODE_ID"
@@ -805,8 +873,10 @@ if [ "$NODE_IO" = "1" ] && [ -d "$WORKDIR" ] && [ -w "$WORKDIR" ]; then
   if [ -f "$IO" ]; then
     python3 "$IO" start --node "$NODE_ID" --kind {_bash_single(kind)} --label {_bash_single(label_text)} --prompt-file "$PROMPT_FILE" || true
   else
-    echo "node io helper missing at $IO; skipping per-node upload" >&2
+    echo "node io: helper missing at $IO (src={_bash_single(helper_src)}); skipping per-node upload" >&2
   fi
+else
+  echo "node io: wrap skipped for $NODE_ID (NODE_IO=$NODE_IO WORKDIR=$WORKDIR writable=$([ -w "$WORKDIR" ] && echo yes || echo no) RUN_ID=${{RUN_ID:-unset}})" >&2
 fi
 set +e
 (
@@ -849,6 +919,9 @@ def kimi_io_env(
         "MIDKERNEL_NODE_OUTPUTS": ",".join(outputs or []),
         "MIDKERNEL_NODE_IO": "1",
     }
+    image_bin = Path("/opt/midkernel/kimi.bin")
+    if image_bin.is_file() and not env_first("MIDKERNEL_KIMI_BIN"):
+        env["MIDKERNEL_KIMI_BIN"] = str(image_bin)
     if model:
         env["MIDKERNEL_NODE_MODEL"] = model
     if parent_id or is_dynamic_node(nid):
@@ -862,7 +935,12 @@ def real_kimi_bin() -> str:
     pinned = env_first("MIDKERNEL_KIMI_BIN")
     if pinned:
         return pinned
-    self = Path(__file__).resolve()
+    # Runner image PATH ``kimi`` is a wrapper that requires report.md after
+    # *every* invocation. Intermediate GOAL nodes must call the real binary.
+    image_bin = Path("/opt/midkernel/kimi.bin")
+    if image_bin.is_file():
+        return str(image_bin)
+    self = source_script_path()
     which = shutil.which("kimi")
     if which:
         candidate = Path(which).resolve()

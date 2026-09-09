@@ -66,3 +66,7 @@ def test_readme_documents_openrouter_lock_and_default_targets() -> None:
     assert "nodes/<nodeId>/prompt.md" in readme
     assert "nodes/<nodeId>/output.md" in readme
     assert "nodes/<nodeId>/meta.json" in readme
+    assert "MIDKERNEL_NODE_IO" in readme
+    assert "MIDKERNEL_KIMI_BIN" in readme
+    assert "scripts/ecs-in-task.sh" in readme
+    assert "sha256(text.trim())" in readme or "text.trim()" in readme

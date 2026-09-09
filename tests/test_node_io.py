@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -165,6 +167,11 @@ def test_wrap_shell_script_keeps_body_and_uploads(io_home: Path) -> None:
     assert "failed" in wrapped
     assert "MIDKERNEL_NODE_IO" in wrapped
     assert "RUN_ID" in wrapped
+    assert 'export WORKDIR="${WORKDIR:-/workspace}"' in wrapped
+    mkdir_at = wrapped.index('mkdir -p "$WORKDIR"')
+    gate_at = wrapped.index('[ -d "$WORKDIR" ] && [ -w "$WORKDIR" ]')
+    assert mkdir_at < gate_at
+    assert "node io: wrap skipped" in wrapped
 
 
 def test_node_io_disabled_without_run_or_flag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -181,15 +188,21 @@ def test_node_io_disabled_without_run_or_flag(tmp_path: Path, monkeypatch: pytes
     assert not (tmp_path / ".midkernel").exists()
 
 
-def test_node_io_disabled_when_workdir_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_node_io_disabled_when_workdir_missing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     missing = "/this-workdir-does-not-exist-midkernel-io"
     monkeypatch.setenv("WORKDIR", missing)
     monkeypatch.setenv("RUN_ID", "run-ci")
     monkeypatch.setenv("MIDKERNEL_NODE_IO", "1")
     assert not Path(missing).exists()
     assert io.node_io_enabled() is False
+    assert io.node_io_disabled_reason() == f"WORKDIR_missing:{missing}"
     io.bootstrap_run_io({"name": "x", "nodes": []})
     assert not Path(missing).exists()
+    err = capsys.readouterr().err
+    assert "node io: disabled during bootstrap_run_io" in err
+    assert "WORKDIR_missing" in err
 
 
 def test_node_io_explicit_off_even_with_run(io_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -208,6 +221,73 @@ def test_node_io_explicit_on_without_run_id(tmp_path: Path, monkeypatch: pytest.
     assert io.node_io_enabled() is True
     dest = io.install_runtime()
     assert dest is not None and dest.is_file()
+
+
+def test_wrap_mkdirs_missing_workdir_and_installs_helper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Prepare used to mkdir only inside the inner script; wrap must create first."""
+    work = tmp_path / "task-disk"
+    assert not work.exists()
+    monkeypatch.setenv("WORKDIR", str(work))
+    monkeypatch.setenv("RUN_ID", "run-wrap")
+    monkeypatch.setenv("MIDKERNEL_IO_SKIP_S3", "1")
+    monkeypatch.setenv("MIDKERNEL_IO_DIR", str(work / "s3"))
+    monkeypatch.delenv("MIDKERNEL_NODE_IO", raising=False)
+    wrapped = io.wrap_shell_script("prepare", "echo prepared-ok\n", outputs=[])
+    script = tmp_path / "wrap.sh"
+    script.write_text("#!/bin/bash\n" + wrapped + "\n", encoding="utf-8")
+    env = os.environ.copy()
+    env.update(
+        {
+            "WORKDIR": str(work),
+            "RUN_ID": "run-wrap",
+            "MIDKERNEL_IO_SKIP_S3": "1",
+            "MIDKERNEL_IO_DIR": str(work / "s3"),
+        }
+    )
+    env.pop("MIDKERNEL_NODE_IO", None)
+    result = subprocess.run(
+        ["bash", str(script)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "prepared-ok" in result.stdout
+    assert work.is_dir()
+    assert (work / ".midkernel" / "node_io.py").is_file()
+    assert (work / "s3" / "runs" / "run-wrap" / "graph.json").is_file()
+
+
+def test_kimi_executable_is_source_helper() -> None:
+    path = io.kimi_executable()
+    assert path.endswith("pipelines/_node_io.py") or path.endswith("_node_io.py")
+    assert Path(path).is_file()
+    assert Path(path).resolve() == io.source_script_path()
+
+
+def test_node_io_gate_silent_without_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("WORKDIR", str(tmp_path))
+    monkeypatch.delenv("RUN_ID", raising=False)
+    monkeypatch.delenv("MIDKERNEL_NODE_IO", raising=False)
+    io.log_node_io_gate("emit")
+    assert capsys.readouterr().err == ""
+
+
+def test_ecs_in_task_script_exports_contract() -> None:
+    script = Path(__file__).resolve().parents[1] / "scripts" / "ecs-in-task.sh"
+    text = script.read_text(encoding="utf-8")
+    assert script.is_file()
+    assert "MIDKERNEL_NODE_IO" in text
+    assert "MIDKERNEL_AGENTFLOW_TARGET" in text
+    assert 'WORKDIR="${WORKDIR:-/workspace}"' in text
+    assert "MIDKERNEL_KIMI_BIN" in text
+    assert "agentflow run" in text
+    assert "pipelines/${PLAYBOOK}.py" in text or 'pipelines/${PLAYBOOK}.py' in text
 
 
 def test_utc_now_is_zulu() -> None:

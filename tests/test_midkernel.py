@@ -81,6 +81,9 @@ def test_prepare_script_bakes_playbook_defaults() -> None:
     assert "bounty-target-jito-firebam" not in security
     assert ": \"${GITHUB_OWNER:?GITHUB_OWNER is required" in security
     assert "--no-recurse-submodules" in security
+    assert 'export MIDKERNEL_NODE_IO="${MIDKERNEL_NODE_IO:-1}"' in security
+    assert "export WORKDIR" in security
+    assert "node io: prepare WORKDIR=" in security
 
     solana = mk.prepare_script("solana-validator-security")
     assert "PLAYBOOK_SLUG:-solana-validator-security" in solana
@@ -150,6 +153,9 @@ def test_build_scan_graph_unchanged_shape() -> None:
     assert ids == ["prepare", "review", "publish"]
     nodes = {node["id"]: node for node in payload["nodes"]}
     assert nodes["review"]["executable"].endswith("node_io.py")
+    assert Path(nodes["review"]["executable"]).resolve() == (
+        Path(__file__).resolve().parents[1] / "pipelines" / "_node_io.py"
+    ).resolve()
     assert nodes["review"]["env"]["MIDKERNEL_NODE_ID"] == "review"
     assert "python3" in nodes["prepare"]["prompt"]
     assert "refusing to upload a stub" in nodes["publish"]["prompt"]

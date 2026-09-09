@@ -15,15 +15,15 @@ from typing import Any
 try:
     from ._node_io import (  # type: ignore[import-not-found]
         bootstrap_run_io,
+        kimi_executable,
         kimi_io_env,
-        runtime_script_path,
         wrap_shell_script,
     )
 except ImportError:  # ``python3 pipelines/<slug>.py`` puts this dir on sys.path
     from _node_io import (  # type: ignore[import-not-found]
         bootstrap_run_io,
+        kimi_executable,
         kimi_io_env,
-        runtime_script_path,
         wrap_shell_script,
     )
 
@@ -381,8 +381,14 @@ case "$OPENROUTER_MODEL" in
   openrouter/*) OPENROUTER_MODEL="${OPENROUTER_MODEL#openrouter/}" ;;
 esac
 
-mkdir -p "$WORKDIR" "$OUTPUTS_DIR" "$HOME/.kimi"
+export WORKDIR
+export OUTPUTS_DIR
+mkdir -p "$WORKDIR" "$OUTPUTS_DIR" "$HOME/.kimi" "$WORKDIR/.midkernel"
 export MIDKERNEL_NODE_IO="${MIDKERNEL_NODE_IO:-1}"
+if [ -x /opt/midkernel/kimi.bin ]; then
+  export MIDKERNEL_KIMI_BIN="${MIDKERNEL_KIMI_BIN:-/opt/midkernel/kimi.bin}"
+fi
+echo "node io: prepare WORKDIR=$WORKDIR RUN_ID=${RUN_ID:-unset} MIDKERNEL_NODE_IO=$MIDKERNEL_NODE_IO MIDKERNEL_AGENTFLOW_TARGET=${MIDKERNEL_AGENTFLOW_TARGET:-}" >&2
 
 python3 - "$OPENROUTER_SECRET_ID" "$GITHUB_TOKEN_SECRET_ID" "$AWS_REGION" <<'PY'
 import json, os, sys
@@ -530,7 +536,7 @@ def build_scan_graph(slug: str, *, description: str):
             tools="read_write",
             provider=openrouter_provider(),
             env={**openrouter_node_env(), **kimi_io_env("review", outputs=[REPORT_NAME], model=model)},
-            executable=str(runtime_script_path()),
+            executable=kimi_executable(),
             extra_args=["--config", kimi_openrouter_config(model)],
             timeout_seconds=timeout,
             retries=0,
@@ -639,7 +645,7 @@ def _kimi_scan_node(
         "tools": "read_write",
         "provider": openrouter_provider(),
         "env": env,
-        "executable": str(runtime_script_path()),
+        "executable": kimi_executable(),
         "extra_args": ["--config", kimi_openrouter_config(slug)],
         "timeout_seconds": timeout_seconds or PROFILE_TIMEOUT_SECONDS[scan_profile()],
         "retries": 0,
