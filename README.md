@@ -41,9 +41,9 @@ The markdown **body** (after frontmatter) is the skill prompt. The graph loads i
 
    `MIDKERNEL_AGENTFLOW_TARGET=local` keeps nodes **inside the already-launched task** (same filesystem, midkernel-dev task role, log group `/agentflow`). That avoids nested `RunTask` and stock agentflow creating IAM role `agentflow-ecs-execution` plus log group `/agentflow/<node.id>`.
 
-4. The graph then runs inside that task. Default playbooks (`security-review`, Solana, Firedancer) are **prepare** → **review** → **publish**. `goal-security-review` is **prepare** → **threat-model** → **goal-author** → **surface-split** → **hunter-1..hunter-6** → **judge-a** → **judge-b** → **assemble** → **publish**. Missing, empty, or stub `report.md` fails publish; nothing is uploaded.
+4. The graph then runs inside that task. Default playbooks (`security-review`, Solana, Firedancer) are **prepare** → **review** → **publish**. `goal-security-review` is **prepare** → **threat-model** → **goal-author** → **surface-split** → **hunter-1..N** (`GOAL_COUNT`, default 6) → **judge-a** → **judge-b** → **assemble** → **publish**. Missing, empty, or stub `report.md` fails publish; the final report key is not written.
 
-`externalAgentflowId` on the Run stays the Fargate task ARN. Observe completion the same way as today (`GET /api/runs/:id` + cron). Presign `s3://midkernel-dev-artifacts/runs/<RUN_ID>/report.md`.
+`externalAgentflowId` on the Run stays the Fargate task ARN. Observe completion the same way as today (`GET /api/runs/:id` + cron). Presign `s3://midkernel-dev-artifacts/runs/<RUN_ID>/report.md`. The Run UI also reads `graph.json` and per-node prompt/output/meta (see [Live graph artifacts](#live-graph-artifacts-run-ui)).
 
 ### Optional later: agentflow as the ECS control plane
 
@@ -64,7 +64,7 @@ From `pipelines/_midkernel.py` / app `AGENTFLOW_DEV_DEFAULTS`:
 | execution role | `arn:aws:iam::489470371031:role/midkernel-dev-ecsTaskExecutionRole` |
 | task role | `arn:aws:iam::489470371031:role/midkernel-dev-ecsTaskRole` |
 | logs | `/agentflow` |
-| artifacts | `s3://midkernel-dev-artifacts/runs/<RUN_ID>/report.md` |
+| artifacts | `s3://midkernel-dev-artifacts/runs/<RUN_ID>/report.md` plus live `graph.json` / `nodes/<id>/` |
 
 `ECSTarget` in agentflow (pinned runner ref `09df0175ff2c88528c99b9f2c22f25b5e7622a8e`) accepts cluster, image, subnets, security groups, `assign_public_ip`, cpu/memory. It does **not** accept execution/task role ARNs or log group — those stay on the app-registered task definition.
 
@@ -82,7 +82,7 @@ Coordinate names with `midkernel/app` (`src/lib/agentflow-contract.ts`) and `mid
 | `PLAYBOOK` | `PLAYBOOK_SLUG` | no | Default `security-review` |
 | `PROFILE` | `SCAN_PROFILE` | no | `low` \| `balanced` \| `max` |
 | `THREAT` | `THREAT_PIN` | no | Optional pin, max 80 chars. Not a fourth profile. `goal-security-review` folds it into `THREAT_MODEL.md` |
-| `GOAL_COUNT` | same | no | `goal-security-review` only. How many goal files to author. Default **6** (5 surfaces + 1 open roam). Max 6 (fixed `hunter-1`…`hunter-6`) |
+| `GOAL_COUNT` | same | no | `goal-security-review` only. How many goal files to author **and** how many `hunter-*` nodes to emit. Default **6** (5 surfaces + 1 open roam). Max 6 |
 | `JUDGE_A_MODEL` | same | no | OpenRouter slug for the relevance judge. Default `OPENROUTER_MODEL` / `moonshotai/kimi-k3` |
 | `JUDGE_B_MODEL` | same | no | OpenRouter slug for the PoC/exploitability judge. Default `anthropic/claude-sonnet-4.5` (falls back to `openai/gpt-4o` if that would match judge-a) |
 | `ARTIFACTS_BUCKET` | same | no | Default `midkernel-dev-artifacts` |
@@ -105,7 +105,25 @@ export KIMI_API_KEY="$OPENROUTER_API_KEY"
 export OPENAI_BASE_URL="https://openrouter.ai/api/v1"
 ```
 
-Harness secrets are never in git. Image/task role may `GetSecretValue` on the two SM names above and `PutObject` on the artifacts prefix.
+Harness secrets are never in git. Image/task role may `GetSecretValue` on the two SM names above and `PutObject` on the artifacts prefix (`runs/<RUN_ID>/` including `graph.json` and `nodes/<id>/`).
+
+## Live graph artifacts (Run UI)
+
+Each agentflow node uploads its own I/O so the app can render a ReactFlow graph (status colors, prompt/output, progress %, ETA). Helpers live in `pipelines/_node_io.py` (wired from `_midkernel.py`) so `security-review` and `goal-security-review` share the same layout. Names stay aligned with app `src/lib/agentflow-contract.ts` (`RUN_ID`, `ARTIFACTS_BUCKET`, `ARTIFACTS_PREFIX`, `ARTIFACTS_KEY`).
+
+```
+s3://midkernel-dev-artifacts/runs/<RUN_ID>/report.md                 # final assemble (unchanged; stub-refusing)
+s3://midkernel-dev-artifacts/runs/<RUN_ID>/graph.json                # topology + status + progress + ETA
+s3://midkernel-dev-artifacts/runs/<RUN_ID>/nodes/<nodeId>/prompt.md
+s3://midkernel-dev-artifacts/runs/<RUN_ID>/nodes/<nodeId>/output.md
+s3://midkernel-dev-artifacts/runs/<RUN_ID>/nodes/<nodeId>/meta.json
+```
+
+`graph.json` nodes: `{ id, label, kind, status, startedAt?, finishedAt?, parentId?, dynamic?, artifacts }`. Edges: `{ id, source, target }`. Progress: `{ completed, total, percent, etaSeconds }` — ETA is `elapsed / completed * remaining` once at least one node has completed; otherwise `null`.
+
+Production runs are **in-task** (`MIDKERNEL_AGENTFLOW_TARGET=local`, shared disk). Graph emit (`python pipelines/*.py`, `agentflow validate`) is side-effect free: it prints PipelineSpec JSON and does not write disk or S3. Per-node I/O bootstraps only when a run is actually executing — `WORKDIR` already exists and is writable, and either `RUN_ID` is set or `MIDKERNEL_NODE_IO=1` (ECS prepare/runtime can export that). Then the helper is copied to `$WORKDIR/.midkernel/node_io.py`, `graph.json` is seeded, and each node's prompt is uploaded. Shell nodes wrap start/finish around their script (including failure + partial output). Kimi nodes set `executable` to that helper so the same process uploads prompt at start and output + meta on success or failure. Dynamic hunters (`hunter-1`…`N` from `GOAL_COUNT`) are first-class: present in `graph.json` with edges `surface-split → hunter-N → judge-a`, and re-spawned (idempotent) when `surface-split` finishes.
+
+Deviation vs a purely dynamic agentflow fan-out: agentflow still needs the hunter copies declared when the graph is emitted. `GOAL_COUNT` is read then (task env), so N is exact for that run. Hunters are marked `dynamic: true` for the UI. The published ECS-per-node path (`MIDKERNEL_AGENTFLOW_TARGET=ecs`) still embeds the helper in each shell script; Kimi I/O there requires the helper file on the task disk (the in-task path is the one Midkernel actually launches).
 
 ## Playbooks
 
@@ -135,7 +153,7 @@ Graph (shared-workspace file handoff under the cloned repo):
 2. **threat-model** — write `THREAT_MODEL.md` (attacker, entry points, trust boundaries, what does **not** count). Honors `THREAT` / `THREAT_PIN`. Does not prescribe how to hunt.
 3. **goal-author** — from the threat model, write N goal prompts under `goals/` (`01-*.md` …). Each file is one precise success condition. Self-red-teams lazy outs. `GOAL_COUNT` default **6** (5 surfaces + 1 open roam).
 4. **surface-split** — read the tree + threat model; assign surfaces / open roam into those goal files. Persistence: “no bugs found yet” is not done.
-5. **hunter-1** … **hunter-6** — fixed fan-out (agentflow does not spawn a dynamic N at runtime). Each picks `goals/0N-*.md` if present and no-ops cleanly if missing. Candidates go under `findings/hunter-N/`. **No** known-issues / GitHub issue-or-PR duplicate search.
+5. **hunter-1** … **hunter-N** — first-class dynamic nodes from `GOAL_COUNT` (default 6). Each picks `goals/0N-*.md` if present and no-ops cleanly if missing. Candidates go under `findings/hunter-N/`. **No** known-issues / GitHub issue-or-PR duplicate search. `graph.json` records `surface-split → hunter-N → judge-a`.
 6. **judge-a** — security-relevance vs `THREAT_MODEL.md` (default Kimi / `OPENROUTER_MODEL`). Survivors → `findings/validated-a/`.
 7. **judge-b** — PoC / exploitability on a **different** OpenRouter model (default `anthropic/claude-sonnet-4.5`). Survivors → `findings/validated-b/`.
 8. **assemble** — only dual-pass survivors → `report.md`. Empty findings with evidence of what was tried is allowed. Never invent. No stub language.

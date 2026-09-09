@@ -12,6 +12,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+try:
+    from ._node_io import (  # type: ignore[import-not-found]
+        bootstrap_run_io,
+        kimi_io_env,
+        runtime_script_path,
+        wrap_shell_script,
+    )
+except ImportError:  # ``python3 pipelines/<slug>.py`` puts this dir on sys.path
+    from _node_io import (  # type: ignore[import-not-found]
+        bootstrap_run_io,
+        kimi_io_env,
+        runtime_script_path,
+        wrap_shell_script,
+    )
+
 # ---------------------------------------------------------------------------
 # Midkernel-dev ECS (existing infra — do not invent VPC / SG / IAM)
 # IDs match midkernel/app AGENTFLOW_DEV_DEFAULTS and midkernel/infra outputs.
@@ -155,7 +170,7 @@ def openrouter_model() -> str:
 
 
 def goal_count() -> int:
-    """Runtime/author hint. Graph hunters stay fixed at hunter-1..hunter-6."""
+    """How many hunter-* nodes to emit (default 6, max 6). First-class dynamic nodes."""
     raw = env_first("GOAL_COUNT", default=str(DEFAULT_GOAL_COUNT))
     try:
         value = int(raw)
@@ -183,6 +198,15 @@ def judge_b_model() -> str:
 
 
 def artifact_key(run_id: str | None = None) -> str:
+    """Final assemble object: ``runs/<RUN_ID>/report.md`` (unchanged).
+
+    Live Run UI objects (see ``pipelines/_node_io.py``) sit next to it::
+
+        runs/<RUN_ID>/graph.json
+        runs/<RUN_ID>/nodes/<nodeId>/prompt.md
+        runs/<RUN_ID>/nodes/<nodeId>/output.md
+        runs/<RUN_ID>/nodes/<nodeId>/meta.json
+    """
     rid = (run_id or env_first("RUN_ID") or "<RUN_ID>").strip()
     prefix = env_first("ARTIFACTS_PREFIX", default=ARTIFACTS_PREFIX)
     prefix = prefix.strip().strip("/") or "runs"
@@ -358,6 +382,7 @@ case "$OPENROUTER_MODEL" in
 esac
 
 mkdir -p "$WORKDIR" "$OUTPUTS_DIR" "$HOME/.kimi"
+export MIDKERNEL_NODE_IO="${MIDKERNEL_NODE_IO:-1}"
 
 python3 - "$OPENROUTER_SECRET_ID" "$GITHUB_TOKEN_SECRET_ID" "$AWS_REGION" <<'PY'
 import json, os, sys
@@ -494,7 +519,7 @@ def build_scan_graph(slug: str, *, description: str):
     ) as graph:
         prepare = shell(
             task_id="prepare",
-            script=prepare_script(slug),
+            script=wrap_shell_script("prepare", prepare_script(slug), outputs=[]),
             timeout_seconds=10 * 60,
             target=node_target(),
         )
@@ -504,7 +529,8 @@ def build_scan_graph(slug: str, *, description: str):
             model=model,
             tools="read_write",
             provider=openrouter_provider(),
-            env=openrouter_node_env(),
+            env={**openrouter_node_env(), **kimi_io_env("review", outputs=[REPORT_NAME], model=model)},
+            executable=str(runtime_script_path()),
             extra_args=["--config", kimi_openrouter_config(model)],
             timeout_seconds=timeout,
             retries=0,
@@ -516,7 +542,7 @@ def build_scan_graph(slug: str, *, description: str):
         )
         publish = shell(
             task_id="publish",
-            script=PUBLISH_SCRIPT.strip(),
+            script=wrap_shell_script("publish", PUBLISH_SCRIPT.strip(), outputs=[]),
             timeout_seconds=5 * 60,
             target=node_target(cwd=review_cwd),
             success_criteria=[
@@ -528,7 +554,10 @@ def build_scan_graph(slug: str, *, description: str):
 
 
 def emit(slug: str, *, description: str) -> None:
-    print(build_scan_graph(slug, description=description).to_json())
+    graph = build_scan_graph(slug, description=description)
+    # No disk/S3 during validate; bootstrap is a no-op unless a run is live.
+    bootstrap_run_io(graph.to_payload())
+    print(graph.to_json())
 
 
 def clone_instructions(slug: str) -> str:
@@ -586,17 +615,31 @@ def _kimi_scan_node(
     timeout_seconds: int | None = None,
     success_criteria: list[dict[str, str]] | None = None,
     cwd: str | None = None,
+    outputs: list[str] | None = None,
+    parent_id: str | None = None,
+    dynamic: bool | None = None,
 ):
     from agentflow import kimi
 
     slug = model or openrouter_model()
+    env = openrouter_node_env()
+    env.update(
+        kimi_io_env(
+            task_id,
+            outputs=outputs,
+            model=slug,
+            parent_id=parent_id,
+            dynamic=dynamic,
+        )
+    )
     kwargs: dict[str, Any] = {
         "task_id": task_id,
         "prompt": prompt,
         "model": slug,
         "tools": "read_write",
         "provider": openrouter_provider(),
-        "env": openrouter_node_env(),
+        "env": env,
+        "executable": str(runtime_script_path()),
         "extra_args": ["--config", kimi_openrouter_config(slug)],
         "timeout_seconds": timeout_seconds or PROFILE_TIMEOUT_SECONDS[scan_profile()],
         "retries": 0,
@@ -752,9 +795,9 @@ def assemble_prompt(slug: str) -> str:
 def build_goal_scan_graph(slug: str, *, description: str):
     """prepare → threat-model → goal-author → surface-split → hunters → judges → assemble → publish.
 
-    Hunters are a fixed fan-out (hunter-1..hunter-6). Each picks goals/0N-*.md
-    if present and no-ops cleanly if missing. Known-issues / GitHub dedupe is
-    intentionally omitted.
+    Hunters are first-class dynamic nodes ``hunter-1``…``hunter-N`` from
+    ``GOAL_COUNT`` (default 6, max 6). Each picks ``goals/0N-*.md`` if present
+    and no-ops cleanly if missing. Known-issues / GitHub dedupe is omitted.
     """
     from agentflow import Graph, shell
 
@@ -762,17 +805,18 @@ def build_goal_scan_graph(slug: str, *, description: str):
     cwd = repo_dir() if agentflow_target_mode() == "local" else None
     judge_a = judge_a_model()
     judge_b = judge_b_model()
+    hunters_n = goal_count()
 
     with Graph(
         slug,
         description=description,
         working_dir=".",
-        concurrency=MAX_GOAL_HUNTERS,
+        concurrency=max(hunters_n, 1),
         fail_fast=True,
     ) as graph:
         prepare = shell(
             task_id="prepare",
-            script=prepare_script(slug),
+            script=wrap_shell_script("prepare", prepare_script(slug), outputs=[]),
             timeout_seconds=10 * 60,
             target=node_target(),
         )
@@ -782,6 +826,7 @@ def build_goal_scan_graph(slug: str, *, description: str):
             timeout_seconds=timeout,
             success_criteria=_file_criteria(THREAT_MODEL_NAME),
             cwd=cwd,
+            outputs=[THREAT_MODEL_NAME],
         )
         author = _kimi_scan_node(
             task_id="goal-author",
@@ -789,6 +834,7 @@ def build_goal_scan_graph(slug: str, *, description: str):
             timeout_seconds=timeout,
             success_criteria=_file_criteria(GOALS_MANIFEST),
             cwd=cwd,
+            outputs=[GOALS_MANIFEST],
         )
         split = _kimi_scan_node(
             task_id="surface-split",
@@ -796,6 +842,7 @@ def build_goal_scan_graph(slug: str, *, description: str):
             timeout_seconds=timeout,
             success_criteria=_file_criteria(GOALS_MANIFEST),
             cwd=cwd,
+            outputs=[GOALS_MANIFEST],
         )
         hunters = [
             _kimi_scan_node(
@@ -804,8 +851,11 @@ def build_goal_scan_graph(slug: str, *, description: str):
                 timeout_seconds=timeout,
                 success_criteria=_file_criteria(f"findings/hunter-{index}/RESULT.md"),
                 cwd=cwd,
+                outputs=[f"findings/hunter-{index}/RESULT.md"],
+                parent_id="surface-split",
+                dynamic=True,
             )
-            for index in range(1, MAX_GOAL_HUNTERS + 1)
+            for index in range(1, hunters_n + 1)
         ]
         relevance = _kimi_scan_node(
             task_id="judge-a",
@@ -814,6 +864,7 @@ def build_goal_scan_graph(slug: str, *, description: str):
             timeout_seconds=timeout,
             success_criteria=_file_criteria(VALIDATED_A_MANIFEST),
             cwd=cwd,
+            outputs=[VALIDATED_A_MANIFEST],
         )
         exploit = _kimi_scan_node(
             task_id="judge-b",
@@ -822,6 +873,7 @@ def build_goal_scan_graph(slug: str, *, description: str):
             timeout_seconds=timeout,
             success_criteria=_file_criteria(VALIDATED_B_MANIFEST),
             cwd=cwd,
+            outputs=[VALIDATED_B_MANIFEST],
         )
         assemble = _kimi_scan_node(
             task_id="assemble",
@@ -829,10 +881,11 @@ def build_goal_scan_graph(slug: str, *, description: str):
             timeout_seconds=timeout,
             success_criteria=_file_criteria(REPORT_NAME),
             cwd=cwd,
+            outputs=[REPORT_NAME],
         )
         publish = shell(
             task_id="publish",
-            script=PUBLISH_SCRIPT.strip(),
+            script=wrap_shell_script("publish", PUBLISH_SCRIPT.strip(), outputs=[]),
             timeout_seconds=5 * 60,
             target=node_target(cwd=cwd),
             success_criteria=[
@@ -846,7 +899,10 @@ def build_goal_scan_graph(slug: str, *, description: str):
 
 
 def emit_goal(slug: str, *, description: str) -> None:
-    print(build_goal_scan_graph(slug, description=description).to_json())
+    graph = build_goal_scan_graph(slug, description=description)
+    # No disk/S3 during validate; bootstrap is a no-op unless a run is live.
+    bootstrap_run_io(graph.to_payload())
+    print(graph.to_json())
 
 
 PUBLISH_SCRIPT = r"""

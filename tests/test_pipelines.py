@@ -43,6 +43,8 @@ pytest.importorskip("agentflow")
 def _load(slug: str, env: dict[str, str] | None = None) -> dict:
     merged = os.environ.copy()
     merged.pop("MIDKERNEL_AGENTFLOW_TARGET", None)
+    merged.pop("RUN_ID", None)
+    merged["MIDKERNEL_NODE_IO"] = "0"
     if env:
         merged.update(env)
     result = subprocess.run(
@@ -68,6 +70,8 @@ def test_security_review_graph_is_kimi_openrouter_on_midkernel_ecs() -> None:
     assert nodes["publish"]["depends_on"] == ["review"]
 
     review = nodes["review"]
+    assert review["executable"].endswith("node_io.py")
+    assert review["env"]["MIDKERNEL_NODE_ID"] == "review"
     assert review["agent"] == "kimi"
     assert review["provider"]["name"] == "openrouter"
     assert review["provider"]["base_url"] == "https://openrouter.ai/api/v1"
@@ -183,6 +187,12 @@ def test_goal_security_review_graph_nodes_and_openrouter_lock() -> None:
         assert node["target"]["kind"] == "ecs"
         assert node["target"]["cluster"] == "midkernel-dev"
 
+    for index in range(1, 7):
+        hunter = nodes[f"hunter-{index}"]
+        assert hunter["env"]["MIDKERNEL_NODE_DYNAMIC"] == "1"
+        assert hunter["env"]["MIDKERNEL_NODE_PARENT"] == "surface-split"
+        assert hunter["executable"].endswith("node_io.py")
+
     assert nodes["judge-a"]["model"] == "moonshotai/kimi-k3"
     assert nodes["judge-b"]["model"] != nodes["judge-a"]["model"]
     assert nodes["judge-b"]["model"] == "anthropic/claude-sonnet-4.5"
@@ -200,6 +210,26 @@ def test_goal_security_review_graph_nodes_and_openrouter_lock() -> None:
     assert publish["agent"] == "shell"
     assert "refusing to upload a stub" in publish["prompt"]
     assert "stub report" in publish["prompt"]
+
+
+def test_goal_security_review_hunters_follow_goal_count() -> None:
+    spec = _load(GOAL_SLUG, env={"GOAL_COUNT": "2"})
+    nodes = {node["id"]: node for node in spec["nodes"]}
+    assert set(nodes) == {
+        "prepare",
+        "threat-model",
+        "goal-author",
+        "surface-split",
+        "hunter-1",
+        "hunter-2",
+        "judge-a",
+        "judge-b",
+        "assemble",
+        "publish",
+    }
+    assert nodes["hunter-1"]["depends_on"] == ["surface-split"]
+    assert nodes["hunter-2"]["depends_on"] == ["surface-split"]
+    assert set(nodes["judge-a"]["depends_on"]) == {"hunter-1", "hunter-2"}
 
 
 def test_goal_security_review_local_in_task_override() -> None:

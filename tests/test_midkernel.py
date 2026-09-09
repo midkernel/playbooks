@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import os
+import json
 from pathlib import Path
 
 import pytest
@@ -145,8 +145,30 @@ def test_build_scan_graph_unchanged_shape() -> None:
         "security-review",
         description="unchanged scan graph",
     )
-    ids = [node["id"] for node in graph.to_payload()["nodes"]]
+    payload = graph.to_payload()
+    ids = [node["id"] for node in payload["nodes"]]
     assert ids == ["prepare", "review", "publish"]
+    nodes = {node["id"]: node for node in payload["nodes"]}
+    assert nodes["review"]["executable"].endswith("node_io.py")
+    assert nodes["review"]["env"]["MIDKERNEL_NODE_ID"] == "review"
+    assert "python3" in nodes["prepare"]["prompt"]
+    assert "refusing to upload a stub" in nodes["publish"]["prompt"]
+    assert "stub report" in nodes["publish"]["prompt"]
+
+
+def test_goal_graph_hunters_follow_goal_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("agentflow")
+    monkeypatch.setenv("GOAL_COUNT", "3")
+    graph = mk.build_goal_scan_graph(
+        "goal-security-review",
+        description="dynamic hunters",
+    )
+    nodes = {node["id"]: node for node in graph.to_payload()["nodes"]}
+    assert "hunter-1" in nodes and "hunter-2" in nodes and "hunter-3" in nodes
+    assert "hunter-4" not in nodes
+    assert nodes["hunter-1"]["env"]["MIDKERNEL_NODE_DYNAMIC"] == "1"
+    assert nodes["hunter-1"]["env"]["MIDKERNEL_NODE_PARENT"] == "surface-split"
+    assert set(nodes["judge-a"]["depends_on"]) == {"hunter-1", "hunter-2", "hunter-3"}
 
 
 def test_review_prompt_names_default_targets() -> None:
@@ -164,3 +186,30 @@ def test_review_prompt_names_default_targets() -> None:
     assert "`main`" in firedancer
     assert "sanitizer" in firedancer.lower()
     assert "agave/" in firedancer
+
+
+def test_emit_is_side_effect_free_without_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pytest.importorskip("agentflow")
+    monkeypatch.setenv("WORKDIR", str(tmp_path))
+    monkeypatch.delenv("RUN_ID", raising=False)
+    monkeypatch.delenv("MIDKERNEL_NODE_IO", raising=False)
+    mk.emit("security-review", description="validate only")
+    assert not (tmp_path / ".midkernel").exists()
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["name"] == "security-review"
+    assert payload["nodes"]
+
+
+def test_emit_goal_is_side_effect_free_without_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pytest.importorskip("agentflow")
+    monkeypatch.setenv("WORKDIR", str(tmp_path))
+    monkeypatch.delenv("RUN_ID", raising=False)
+    monkeypatch.delenv("MIDKERNEL_NODE_IO", raising=False)
+    mk.emit_goal("goal-security-review", description="validate only")
+    assert not (tmp_path / ".midkernel").exists()
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["name"] == "goal-security-review"
