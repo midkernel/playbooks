@@ -328,3 +328,18 @@ def test_goal_security_review_midkernel_alias_override() -> None:
     nodes = {node["id"]: node for node in spec["nodes"]}
     assert nodes["hunter-1"]["env"]["KIMI_MAX_TOKENS"] == "65536"
     assert nodes["hunter-1"]["env"]["MIDKERNEL_OPENROUTER_MAX_TOKENS"] == "65536"
+
+
+def test_goal_security_review_env_first_wins_midkernel_over_kimi() -> None:
+    spec = _load(
+        GOAL_SLUG,
+        env={
+            "KIMI_MAX_TOKENS": "4096",
+            "OPENROUTER_MAX_TOKENS": "8192",
+            "MIDKERNEL_OPENROUTER_MAX_TOKENS": "65536",
+        },
+    )
+    nodes = {node["id"]: node for node in spec["nodes"]}
+    assert nodes["hunter-1"]["env"]["KIMI_MAX_TOKENS"] == "65536"
+    assert nodes["hunter-1"]["env"]["OPENROUTER_MAX_TOKENS"] == "65536"
+    assert nodes["hunter-1"]["env"]["MIDKERNEL_OPENROUTER_MAX_TOKENS"] == "65536"

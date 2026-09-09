@@ -65,12 +65,13 @@ OPENROUTER_KEY_PLACEHOLDER = "OVERRIDE_VIA_ENV"
 DEFAULT_KIMI_MAX_TOKENS = 32768
 MAX_SAFE_KIMI_MAX_TOKENS = 65536
 UNSAFE_OPENROUTER_MAX_TOKENS = 131072
+# First-wins order matches midkernel/runner (runner#8).
 MAX_TOKENS_ENV_NAMES = (
-    "KIMI_MAX_TOKENS",
-    "OPENROUTER_MAX_TOKENS",
     "MIDKERNEL_OPENROUTER_MAX_TOKENS",
-    "KIMI_MODEL_MAX_COMPLETION_TOKENS",
+    "OPENROUTER_MAX_TOKENS",
+    "KIMI_MAX_TOKENS",
     "KIMI_MODEL_MAX_TOKENS",
+    "KIMI_MODEL_MAX_COMPLETION_TOKENS",
 )
 NODE_STATUSES = ("pending", "running", "completed", "failed")
 SAFE_NODE_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
@@ -115,15 +116,20 @@ def clamp_kimi_max_tokens(value: int) -> int:
     return value
 
 
+class OpenRouterMaxTokensCapError(ValueError):
+    """chat/completions cannot be forwarded without a clamped ``max_tokens``."""
+
+
 def kimi_max_tokens() -> int:
     """Per-request OpenRouter ``max_tokens`` for every Kimi node.
 
-    Default ``32768``. Hard ceiling ``65536``. Override with ``KIMI_MAX_TOKENS``
-    / ``OPENROUTER_MAX_TOKENS`` / ``MIDKERNEL_OPENROUTER_MAX_TOKENS`` (or
-    kimi-cli ``KIMI_MODEL_MAX_COMPLETION_TOKENS`` / ``KIMI_MODEL_MAX_TOKENS``).
-    ``0`` / negative are ignored — kimi-cli treats those as “disable clamp”,
-    which restores the 131072 reservation that 402s typical keys. ``131072``
-    is **not** a valid opt-in (that is the exact 402 reservation).
+    Default ``32768``. Hard ceiling ``65536``. First-wins env order matches
+    runner: ``MIDKERNEL_OPENROUTER_MAX_TOKENS``, ``OPENROUTER_MAX_TOKENS``,
+    ``KIMI_MAX_TOKENS``, ``KIMI_MODEL_MAX_TOKENS``,
+    ``KIMI_MODEL_MAX_COMPLETION_TOKENS``. ``0`` / negative are ignored —
+    kimi-cli treats those as “disable clamp”, which restores the 131072
+    reservation that 402s typical keys. ``131072`` is **not** a valid opt-in
+    (that is the exact 402 reservation).
     """
     raw = env_first(*MAX_TOKENS_ENV_NAMES, default=str(DEFAULT_KIMI_MAX_TOKENS))
     try:
@@ -165,15 +171,67 @@ def cap_openrouter_payload(payload: dict[str, Any], cap: int) -> dict[str, Any]:
 
 
 def cap_openrouter_request_body(raw: bytes, cap: int) -> bytes:
-    if not raw:
-        return raw
+    """Return JSON that always includes a clamped ``max_tokens``.
+
+    Empty / whitespace-only body → inject ``{"max_tokens": cap}``.
+    Valid JSON object → parse and set / clamp ``max_tokens``.
+    Non-JSON or non-object → raise (never pass the original body through).
+    """
+    cap = clamp_kimi_max_tokens(int(cap))
+    if not raw or not raw.strip():
+        return json.dumps({"max_tokens": cap}, ensure_ascii=False).encode("utf-8")
     try:
         payload = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return raw
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise OpenRouterMaxTokensCapError(
+            "chat/completions body is not JSON; refusing to forward without max_tokens"
+        ) from exc
     if not isinstance(payload, dict):
-        return raw
+        raise OpenRouterMaxTokensCapError(
+            "chat/completions body is not a JSON object; refusing to forward without max_tokens"
+        )
     return json.dumps(cap_openrouter_payload(payload, cap), ensure_ascii=False).encode("utf-8")
+
+
+def read_http_request_body(headers: Any, rfile: Any) -> bytes:
+    """Read a request body. Missing Content-Length is empty, not pass-through."""
+    length_raw = headers.get("Content-Length") if headers is not None else None
+    if length_raw is not None and str(length_raw).strip() != "":
+        try:
+            length = int(length_raw)
+        except (TypeError, ValueError):
+            return b""
+        if length <= 0:
+            return b""
+        return rfile.read(length) or b""
+    encoding = ""
+    if headers is not None:
+        encoding = (headers.get("Transfer-Encoding") or "").lower()
+    if "chunked" in encoding:
+        return _read_chunked_body(rfile)
+    return b""
+
+
+def _read_chunked_body(rfile: Any) -> bytes:
+    chunks: list[bytes] = []
+    while True:
+        line = rfile.readline()
+        if not line:
+            break
+        size_token = line.split(b";", 1)[0].strip()
+        try:
+            size = int(size_token, 16)
+        except ValueError:
+            break
+        if size == 0:
+            while True:
+                trailer = rfile.readline()
+                if not trailer or trailer in {b"\r\n", b"\n"}:
+                    break
+            break
+        chunks.append(rfile.read(size) or b"")
+        rfile.read(2)  # CRLF after chunk
+    return b"".join(chunks)
 
 
 def resolve_upstream_request(upstream_base: str, incoming_path: str) -> tuple[str, str, int, str]:
@@ -246,11 +304,14 @@ class OpenRouterMaxTokensProxy:
                 return
 
             def _forward(self) -> None:
-                length = int(self.headers.get("Content-Length") or 0)
-                raw = self.rfile.read(length) if length > 0 else b""
                 incoming = self.path or "/"
+                raw = read_http_request_body(self.headers, self.rfile)
                 if _is_chat_completions_path(incoming):
-                    raw = cap_openrouter_request_body(raw, proxy.cap)
+                    try:
+                        raw = cap_openrouter_request_body(raw, proxy.cap)
+                    except OpenRouterMaxTokensCapError as exc:
+                        self.send_error(400, str(exc))
+                        return
                 scheme, host, port, path = resolve_upstream_request(proxy.upstream_base, incoming)
                 headers = {
                     key: value
@@ -258,15 +319,14 @@ class OpenRouterMaxTokensProxy:
                     if key.lower() not in _HOP_BY_HOP
                 }
                 headers["Host"] = host
-                if raw:
-                    headers["Content-Length"] = str(len(raw))
+                headers["Content-Length"] = str(len(raw))
                 conn: http.client.HTTPConnection
                 if scheme == "https":
                     conn = http.client.HTTPSConnection(host, port, timeout=600)
                 else:
                     conn = http.client.HTTPConnection(host, port, timeout=600)
                 try:
-                    conn.request(self.command, path, body=raw or None, headers=headers)
+                    conn.request(self.command, path, body=raw if raw else None, headers=headers)
                     upstream = conn.getresponse()
                     self.send_response(upstream.status)
                     for key, value in upstream.getheaders():

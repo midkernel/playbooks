@@ -104,7 +104,7 @@ Coordinate names with `midkernel/app` (`src/lib/agentflow-contract.ts`) and `mid
 | `ARTIFACTS_PREFIX` | same | no | Default `runs/` |
 | `ARTIFACTS_KEY` | same | no | Default `runs/<RUN_ID>/report.md` |
 | `MODEL` / `OPENROUTER_MODEL` | `OPENROUTER_MODEL` | no | OpenRouter slug, default `moonshotai/kimi-k3` (optional `openrouter/` prefix) |
-| `KIMI_MAX_TOKENS` / `OPENROUTER_MAX_TOKENS` / `MIDKERNEL_OPENROUTER_MAX_TOKENS` | same, plus kimi-cli `KIMI_MODEL_MAX_COMPLETION_TOKENS` / `KIMI_MODEL_MAX_TOKENS` | no | Per-request OpenRouter generation cap (`max_tokens`). Default **32768**. Hard ceiling **65536**. `KIMI_MAX_TOKENS=131072` is **not** a valid opt-in (that reservation is the 402). Values `>=131072` or otherwise above **65536** become **32768**. Baked onto every Kimi node in `emit()` / `emit_goal()`. `0` / negative are ignored (kimi-cli would disable the clamp). See [OpenRouter `max_tokens` cap](#openrouter-max_tokens-cap-402) |
+| `MIDKERNEL_OPENROUTER_MAX_TOKENS` / `OPENROUTER_MAX_TOKENS` / `KIMI_MAX_TOKENS` / `KIMI_MODEL_MAX_TOKENS` / `KIMI_MODEL_MAX_COMPLETION_TOKENS` | same (runner first-wins order) | no | Per-request OpenRouter generation cap (`max_tokens`). **First-wins** matches runner: `MIDKERNEL_OPENROUTER_MAX_TOKENS`, then `OPENROUTER_MAX_TOKENS`, then `KIMI_MAX_TOKENS`, then `KIMI_MODEL_MAX_TOKENS`, then `KIMI_MODEL_MAX_COMPLETION_TOKENS`. Default **32768**. Hard ceiling **65536**. `131072` is **not** a valid opt-in (that reservation is the 402). Values `>65536` or `>=131072` become **32768**. Baked onto every Kimi node in `emit()` / `emit_goal()`. `0` / negative are ignored (kimi-cli would disable the clamp). See [OpenRouter `max_tokens` cap](#openrouter-max_tokens-cap-402) |
 | `GITHUB_REF` | same | no | Shallow clone `--branch`. Playbooks with `target_ref` default that ref |
 | `GITHUB_TOKEN` | same | yes* | Installation token; else SM `midkernel/dev/harness/github-token` |
 | `OPENROUTER_API_KEY` | same | yes* | Else SM `midkernel/dev/harness/openrouter-api-key` |
@@ -127,9 +127,9 @@ export KIMI_SHARE_DIR="$WORKDIR/.midkernel/kimi"
 
 In-task Kimi nodes (`executable` = `pipelines/_node_io.py`) set `BASH_ENV=/dev/null` so the runner `node-env.sh` hook does not re-clone. That skips runner `prepare_node` on review / threat-model / hunters. Playbooks therefore:
 
-1. Bake `OPENAI_BASE_URL`, `OPENROUTER_MODEL`, `KIMI_SHARE_DIR`, `HOME`, the `max_tokens` cap (`KIMI_MAX_TOKENS` / `OPENROUTER_MAX_TOKENS` / `MIDKERNEL_OPENROUTER_MAX_TOKENS`), and any emit-time OpenRouter keys onto **every** Kimi node env (`kimi_io_env` / `openrouter_node_env`).
+1. Bake `OPENAI_BASE_URL`, `OPENROUTER_MODEL`, `KIMI_SHARE_DIR`, `HOME`, the `max_tokens` cap (runner first-wins: `MIDKERNEL_OPENROUTER_MAX_TOKENS` / `OPENROUTER_MAX_TOKENS` / `KIMI_MAX_TOKENS` / `KIMI_MODEL_MAX_TOKENS` / `KIMI_MODEL_MAX_COMPLETION_TOKENS`), and any emit-time OpenRouter keys onto **every** Kimi node env (`kimi_io_env` / `openrouter_node_env`).
 2. Pass `extra_args=["--config", "$WORKDIR/.midkernel/kimi/config.toml"]` — a **file path**. Inline TOML made kimi.bin print `LLM not set` (runs `cmtudf0470003jp040742shv6`, `cmtudm8f20003i90462yr3vxq`).
-3. `wrap_kimi` rewrites a non-file `--config`, writes that TOML (including `max_tokens = 32768` next to `max_output_size`, lockstep with runner#8), starts a localhost proxy that injects `max_tokens` on every `chat/completions` body, and forwards the OpenRouter env to `MIDKERNEL_KIMI_BIN`.
+3. `wrap_kimi` rewrites a non-file `--config`, writes that TOML (including `max_tokens = 32768` next to `max_output_size`, lockstep with runner#8), starts a localhost proxy that **never forwards** `chat/completions` without a capped `max_tokens` on the JSON body (empty / missing Content-Length / missing field → inject; non-JSON → 400), and forwards the OpenRouter env to `MIDKERNEL_KIMI_BIN`.
 4. Prepare also writes `$WORKDIR/.midkernel-openrouter` + `$WORKDIR/.midkernel/kimi/config.toml` (cwd for later nodes is `$WORKDIR/repo`).
 
 ### OpenRouter `max_tokens` cap (402)
@@ -141,9 +141,9 @@ Root cause (not a retry tweak): Midkernel config sets `max_context_size = 262144
 Definitive playbooks patch:
 
 1. Default `max_tokens` **32768** on every Kimi invocation in `emit()` / `emit_goal()`.
-2. Env override: `KIMI_MAX_TOKENS` / `OPENROUTER_MAX_TOKENS` / `MIDKERNEL_OPENROUTER_MAX_TOKENS` (also accepts kimi-cli `KIMI_MODEL_MAX_COMPLETION_TOKENS` / `KIMI_MODEL_MAX_TOKENS`). Hard ceiling **65536**. `131072` is **not** a valid opt-in (that is the exact 402 reservation) — values `>=131072` or otherwise above **65536** become **32768**.
+2. Env override, **first-wins** (same as runner): `MIDKERNEL_OPENROUTER_MAX_TOKENS`, `OPENROUTER_MAX_TOKENS`, `KIMI_MAX_TOKENS`, `KIMI_MODEL_MAX_TOKENS`, `KIMI_MODEL_MAX_COMPLETION_TOKENS`. Hard ceiling **65536**. `131072` is **not** a valid opt-in (that is the exact 402 reservation) — values `>65536` or `>=131072` become **32768**.
 3. Prepare / `render_kimi_openrouter_config` write `max_tokens = 32768` next to `max_context_size = 262144` (lockstep with runner#8). `max_output_size` is also written; kimi-cli `openai_legacy` does not honor it.
-4. `wrap_kimi` proxies OpenRouter and **always writes `max_tokens`** on `chat/completions` so the HTTP body cannot 402 from an omitted/131072 reservation. A request body of `max_tokens: 131072` is rewritten to `32768`.
+4. `wrap_kimi` proxies OpenRouter and **never forwards** a `chat/completions` request without a capped `max_tokens` on the JSON body. Empty body, missing Content-Length, or a body without `max_tokens` → inject the clamped cap. Non-JSON → HTTP 400 (do not pass through). A request body of `max_tokens: 131072` is rewritten to `32768`.
 5. Hunter success criteria still require `findings/hunter-N/RESULT.md`. Wrap uploads that file when the model actually writes it. Wrap does **not** invent findings or a stub `RESULT.md` on 402 / empty return.
 
 Harness secrets are never in git. Image/task role may `GetSecretValue` on the two SM names above and `PutObject` on the artifacts prefix (`runs/<RUN_ID>/` including `graph.json` and `nodes/<id>/`).

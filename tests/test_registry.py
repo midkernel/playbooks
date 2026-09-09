@@ -71,6 +71,8 @@ def test_readme_documents_openrouter_lock_and_default_targets() -> None:
     assert "KIMI_MAX_TOKENS" in readme
     assert "OPENROUTER_MAX_TOKENS" in readme
     assert "MIDKERNEL_OPENROUTER_MAX_TOKENS" in readme
+    assert "KIMI_MODEL_MAX_TOKENS" in readme
+    assert "first-wins" in readme.lower() or "First-wins" in readme
     assert "32768" in readme
     assert "65536" in readme
     assert "valid opt-in" in readme

@@ -62,6 +62,13 @@ def test_kimi_config_is_openrouter_legacy() -> None:
 def test_kimi_max_tokens_default_and_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in mk.MAX_TOKENS_ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
+    assert mk.MAX_TOKENS_ENV_NAMES == (
+        "MIDKERNEL_OPENROUTER_MAX_TOKENS",
+        "OPENROUTER_MAX_TOKENS",
+        "KIMI_MAX_TOKENS",
+        "KIMI_MODEL_MAX_TOKENS",
+        "KIMI_MODEL_MAX_COMPLETION_TOKENS",
+    )
     assert mk.kimi_max_tokens() == mk.DEFAULT_KIMI_MAX_TOKENS == 32768
     assert mk.MAX_SAFE_KIMI_MAX_TOKENS == 65536
     assert mk.UNSAFE_OPENROUTER_MAX_TOKENS == 131072
@@ -89,6 +96,25 @@ def test_kimi_max_tokens_default_and_env(monkeypatch: pytest.MonkeyPatch) -> Non
     assert mk.clamp_kimi_max_tokens(65536) == 65536
 
 
+def test_kimi_max_tokens_env_first_wins_matches_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in mk.MAX_TOKENS_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("KIMI_MODEL_MAX_COMPLETION_TOKENS", "1024")
+    monkeypatch.setenv("KIMI_MODEL_MAX_TOKENS", "2048")
+    monkeypatch.setenv("KIMI_MAX_TOKENS", "4096")
+    monkeypatch.setenv("OPENROUTER_MAX_TOKENS", "8192")
+    monkeypatch.setenv("MIDKERNEL_OPENROUTER_MAX_TOKENS", "65536")
+    assert mk.kimi_max_tokens() == 65536
+    monkeypatch.delenv("MIDKERNEL_OPENROUTER_MAX_TOKENS")
+    assert mk.kimi_max_tokens() == 8192
+    monkeypatch.delenv("OPENROUTER_MAX_TOKENS")
+    assert mk.kimi_max_tokens() == 4096
+    monkeypatch.delenv("KIMI_MAX_TOKENS")
+    assert mk.kimi_max_tokens() == 2048
+    monkeypatch.delenv("KIMI_MODEL_MAX_TOKENS")
+    assert mk.kimi_max_tokens() == 1024
+
+
 def test_kimi_extra_args_is_config_file_path() -> None:
     args = mk.kimi_extra_args("moonshotai/kimi-k3")
     assert args[0] == "--config"
@@ -112,6 +138,7 @@ def test_openrouter_node_env_passthrough(monkeypatch: pytest.MonkeyPatch, tmp_pa
     assert env["KIMI_MAX_TOKENS"] == "32768"
     assert env["OPENROUTER_MAX_TOKENS"] == "32768"
     assert env["MIDKERNEL_OPENROUTER_MAX_TOKENS"] == "32768"
+    assert env["KIMI_MODEL_MAX_TOKENS"] == "32768"
     assert env["KIMI_MODEL_MAX_COMPLETION_TOKENS"] == "32768"
 
 
@@ -150,6 +177,11 @@ def test_prepare_script_bakes_playbook_defaults() -> None:
     assert "max_output_size = ${KIMI_MAX_TOKENS}" in security
     assert "KIMI_MAX_TOKENS=" in security
     assert "MIDKERNEL_OPENROUTER_MAX_TOKENS=" in security
+    assert (
+        "${MIDKERNEL_OPENROUTER_MAX_TOKENS:-${OPENROUTER_MAX_TOKENS:-"
+        "${KIMI_MAX_TOKENS:-${KIMI_MODEL_MAX_TOKENS:-"
+        "${KIMI_MODEL_MAX_COMPLETION_TOKENS:-"
+    ) in security
     assert "32768" in security
     assert "max_tokens = 131072" not in security
     assert "max_output_size = 131072" not in security

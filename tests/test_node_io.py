@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import subprocess
 import threading
+import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
 from pathlib import Path
+from typing import Iterator
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -431,6 +437,8 @@ def test_kimi_io_env_passes_openrouter_keys(monkeypatch: pytest.MonkeyPatch, tmp
     assert env["KIMI_MAX_TOKENS"] == "32768"
     assert env["OPENROUTER_MAX_TOKENS"] == "32768"
     assert env["MIDKERNEL_OPENROUTER_MAX_TOKENS"] == "32768"
+    assert env["KIMI_MODEL_MAX_TOKENS"] == "32768"
+    assert env["KIMI_MODEL_MAX_COMPLETION_TOKENS"] == "32768"
 
 
 def test_ensure_kimi_config_rewrites_inline_toml(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -517,6 +525,35 @@ def test_cap_openrouter_payload_never_leaves_131072() -> None:
     assert unsafe_cap["max_tokens"] == 32768
 
 
+def test_cap_openrouter_request_body_empty_or_non_json_never_passthrough() -> None:
+    cap = io.DEFAULT_KIMI_MAX_TOKENS
+    empty = json.loads(io.cap_openrouter_request_body(b"", cap).decode("utf-8"))
+    assert empty == {"max_tokens": 32768}
+    whitespace = json.loads(io.cap_openrouter_request_body(b"  \n", cap).decode("utf-8"))
+    assert whitespace == {"max_tokens": 32768}
+    missing = json.loads(
+        io.cap_openrouter_request_body(b'{"model":"moonshotai/kimi-k3"}', cap).decode("utf-8")
+    )
+    assert missing["max_tokens"] == 32768
+    assert missing["model"] == "moonshotai/kimi-k3"
+    rewritten = json.loads(
+        io.cap_openrouter_request_body(b'{"max_tokens":131072}', cap).decode("utf-8")
+    )
+    assert rewritten["max_tokens"] == 32768
+    with pytest.raises(io.OpenRouterMaxTokensCapError):
+        io.cap_openrouter_request_body(b"not-json", cap)
+    with pytest.raises(io.OpenRouterMaxTokensCapError):
+        io.cap_openrouter_request_body(b"[1,2,3]", cap)
+
+
+def test_read_http_request_body_missing_content_length_is_empty() -> None:
+    assert io.read_http_request_body({}, BytesIO(b'{"max_tokens":131072}')) == b""
+    headers = {"Content-Length": "0"}
+    assert io.read_http_request_body(headers, BytesIO(b'{"x":1}')) == b""
+    headers = {"Content-Length": "18"}
+    assert io.read_http_request_body(headers, BytesIO(b'{"max_tokens":1}')) == b'{"max_tokens":1}'
+
+
 def test_render_kimi_config_writes_max_tokens_and_rejects_131072() -> None:
     text = io.render_kimi_openrouter_config("moonshotai/kimi-k3", max_tokens=32768)
     assert "max_tokens = 32768" in text
@@ -529,7 +566,8 @@ def test_render_kimi_config_writes_max_tokens_and_rejects_131072() -> None:
     assert "max_tokens = 65536" in ceiling
 
 
-def test_openrouter_proxy_injects_max_tokens() -> None:
+@contextmanager
+def _openrouter_proxy_harness() -> Iterator[tuple[str, dict[str, object]]]:
     received: dict[str, object] = {}
 
     class Upstream(BaseHTTPRequestHandler):
@@ -540,7 +578,8 @@ def test_openrouter_proxy_injects_max_tokens() -> None:
             length = int(self.headers.get("Content-Length") or 0)
             raw = self.rfile.read(length)
             received["path"] = self.path
-            received["body"] = json.loads(raw.decode("utf-8"))
+            received["raw"] = raw
+            received["body"] = json.loads(raw.decode("utf-8")) if raw else None
             payload = b'{"id":"ok"}'
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -558,21 +597,83 @@ def test_openrouter_proxy_injects_max_tokens() -> None:
         )
         base = proxy.start()
         try:
-            req = urllib.request.Request(
-                f"{base}/chat/completions",
-                data=json.dumps({"model": "moonshotai/kimi-k3", "max_tokens": 131072}).encode(),
-                method="POST",
-                headers={"Content-Type": "application/json"},
-            )
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                assert resp.status == 200
-            assert received["body"]["max_tokens"] == 32768
-            assert received["path"].endswith("/chat/completions")
+            yield base, received
         finally:
             proxy.stop()
     finally:
         upstream.shutdown()
         upstream.server_close()
+
+
+def test_openrouter_proxy_injects_max_tokens() -> None:
+    with _openrouter_proxy_harness() as (base, received):
+        req = urllib.request.Request(
+            f"{base}/chat/completions",
+            data=json.dumps({"model": "moonshotai/kimi-k3", "max_tokens": 131072}).encode(),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            assert resp.status == 200
+        assert received["body"]["max_tokens"] == 32768
+        assert received["path"].endswith("/chat/completions")
+
+
+def test_openrouter_proxy_injects_missing_max_tokens() -> None:
+    with _openrouter_proxy_harness() as (base, received):
+        req = urllib.request.Request(
+            f"{base}/chat/completions",
+            data=json.dumps({"model": "moonshotai/kimi-k3"}).encode(),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            assert resp.status == 200
+        assert received["body"]["max_tokens"] == 32768
+        assert received["body"]["model"] == "moonshotai/kimi-k3"
+
+
+def test_openrouter_proxy_injects_empty_body() -> None:
+    with _openrouter_proxy_harness() as (base, received):
+        req = urllib.request.Request(
+            f"{base}/chat/completions",
+            data=b"",
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            assert resp.status == 200
+        assert received["body"] == {"max_tokens": 32768}
+
+
+def test_openrouter_proxy_injects_missing_content_length() -> None:
+    with _openrouter_proxy_harness() as (base, received):
+        parts = urlsplit(base)
+        conn = http.client.HTTPConnection(parts.hostname, parts.port, timeout=5)
+        try:
+            conn.putrequest("POST", "/api/v1/chat/completions")
+            conn.putheader("Content-Type", "application/json")
+            conn.endheaders()
+            resp = conn.getresponse()
+            assert resp.status == 200
+            resp.read()
+        finally:
+            conn.close()
+        assert received["body"] == {"max_tokens": 32768}
+
+
+def test_openrouter_proxy_rejects_non_json_chat_completions() -> None:
+    with _openrouter_proxy_harness() as (base, received):
+        req = urllib.request.Request(
+            f"{base}/chat/completions",
+            data=b"not-json",
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(req, timeout=5)
+        assert exc.value.code == 400
+        assert "body" not in received
 
 
 def test_wrap_kimi_does_not_invent_hunter_result(
