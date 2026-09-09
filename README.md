@@ -13,6 +13,8 @@ Private Midkernel-only skills live in the private `skills` repo.
 | `<slug>.md` at repo root | Humans, MCP `list_playbooks`, app registry listing |
 | `pipelines/<slug>.py` | Execution. `agentflow run` / `agentflow validate` |
 | `pipelines/_midkernel.py` | Shared ECS target, env aliases, OpenRouter/Kimi + S3 helpers. Not a playbook |
+| `pipelines/_node_io.py` | Per-node I/O + live `graph.json`. Kimi `executable` |
+| `scripts/ecs-in-task.sh` | Drop-in for runner: in-task `agentflow run` |
 
 Root markdown keeps `list_playbooks` working. The Midkernel Scan plugin walks **root** `.md` / `.yml` / `.yaml` / `.json` and optional `playbooks/`, `workflows/`, or `registry/` directories. It does **not** walk `pipelines/`, so graph files do not pollute the listing. `README.md` and `LICENSE` are ignored.
 
@@ -33,13 +35,20 @@ The markdown **body** (after frontmatter) is the skill prompt. The graph loads i
 
 1. User starts a Scan (`POST /api/scans/start` / MCP `start_run`) with `owner`, `name`, optional `playbook` (default `security-review`), `profile` (`low` \| `balanced` \| `max`), optional `threat` pin.
 2. App creates a Run (`RUN_ID` = run id), burns credits, and submits **one** ECS Fargate Spot `RunTask` on **existing** midkernel-dev infra (see target below). Do **not** call agentflow zero-config (`{"kind":"ecs","region":"us-east-1"}`) — that invents a default-VPC SG named `agentflow` with SSH `0.0.0.0/0`.
-3. The agent image (`midkernel-agentflow-agents`) fetches this repo and runs:
+3. The agent image (`midkernel-agentflow-agents`) must fetch this repo (or bake it) and run **the Python graph**, not the single-kimi helper:
 
    ```bash
-   MIDKERNEL_AGENTFLOW_TARGET=local agentflow run pipelines/${PLAYBOOK}.py
+   export MIDKERNEL_AGENTFLOW_TARGET=local
+   export MIDKERNEL_NODE_IO=1
+   export WORKDIR=/workspace
+   export MIDKERNEL_KIMI_BIN=/opt/midkernel/kimi.bin   # not PATH kimi
+   scripts/ecs-in-task.sh
+   # equivalent: agentflow run pipelines/${PLAYBOOK}.py
    ```
 
    `MIDKERNEL_AGENTFLOW_TARGET=local` keeps nodes **inside the already-launched task** (same filesystem, midkernel-dev task role, log group `/agentflow`). That avoids nested `RunTask` and stock agentflow creating IAM role `agentflow-ecs-execution` plus log group `/agentflow/<node.id>`.
+
+   **Dogfood gap (run `cmtu8jtu00003l1043oi0at41`):** app compiles a Python playbook as a stub node `id=graph` (Vercel cannot exec the Graph API) and RunTask has no command override. The image then runs `midkernel-runner` — clone target + fetch `<slug>.md` + one kimi + `report.md`. `_node_io.py` never runs, so the UI shows graph unavailable. `pipelineSha` `b5083d6b…` **is** current main: the app hashes `text.trim()`, while `sha256sum pipelines/goal-security-review.py` includes the trailing newline (`bda96226…`). Not a stale revision.
 
 4. The graph then runs inside that task. Default playbooks (`security-review`, Solana, Firedancer) are **prepare** → **review** → **publish**. `goal-security-review` is **prepare** → **threat-model** → **goal-author** → **surface-split** → **hunter-1..N** (`GOAL_COUNT`, default 6) → **judge-a** → **judge-b** → **assemble** → **publish**. Missing, empty, or stub `report.md` fails publish; the final report key is not written.
 
@@ -92,7 +101,10 @@ Coordinate names with `midkernel/app` (`src/lib/agentflow-contract.ts`) and `mid
 | `GITHUB_REF` | same | no | Shallow clone `--branch`. Playbooks with `target_ref` default that ref |
 | `GITHUB_TOKEN` | same | yes* | Installation token; else SM `midkernel/dev/harness/github-token` |
 | `OPENROUTER_API_KEY` | same | yes* | Else SM `midkernel/dev/harness/openrouter-api-key` |
-| `MIDKERNEL_AGENTFLOW_TARGET` | same | no | `ecs` (default published graph) or `local` (in-task) |
+| `MIDKERNEL_AGENTFLOW_TARGET` | same | no | `ecs` (default published graph) or `local` (in-task). **Must be `local` on the single ECS task** |
+| `MIDKERNEL_NODE_IO` | same | no | `1` on ECS (prepare/runtime). `0` keeps emit/CI side-effect free |
+| `WORKDIR` | same | no | Shared task disk. Image default `/workspace`. Must exist + be writable when I/O runs |
+| `MIDKERNEL_KIMI_BIN` | same | no | Real kimi-cli. Default `/opt/midkernel/kimi.bin` on the runner image. Do **not** use PATH `kimi` (that wrapper requires `report.md` after every node) |
 | `MIDKERNEL_LOCAL` | same | no | `1` = laptop; use env keys, skip SM |
 
 \*Required at runtime. Fail closed if missing.
@@ -121,7 +133,20 @@ s3://midkernel-dev-artifacts/runs/<RUN_ID>/nodes/<nodeId>/meta.json
 
 `graph.json` nodes: `{ id, label, kind, status, startedAt?, finishedAt?, parentId?, dynamic?, artifacts }`. Edges: `{ id, source, target }`. Progress: `{ completed, total, percent, etaSeconds }` — ETA is `elapsed / completed * remaining` once at least one node has completed; otherwise `null`.
 
-Production runs are **in-task** (`MIDKERNEL_AGENTFLOW_TARGET=local`, shared disk). Graph emit (`python pipelines/*.py`, `agentflow validate`) is side-effect free: it prints PipelineSpec JSON and does not write disk or S3. Per-node I/O bootstraps only when a run is actually executing — `WORKDIR` already exists and is writable, and either `RUN_ID` is set or `MIDKERNEL_NODE_IO=1` (ECS prepare/runtime can export that). Then the helper is copied to `$WORKDIR/.midkernel/node_io.py`, `graph.json` is seeded, and each node's prompt is uploaded. Shell nodes wrap start/finish around their script (including failure + partial output). Kimi nodes set `executable` to that helper so the same process uploads prompt at start and output + meta on success or failure. Dynamic hunters (`hunter-1`…`N` from `GOAL_COUNT`) are first-class: present in `graph.json` with edges `surface-split → hunter-N → judge-a`, and re-spawned (idempotent) when `surface-split` finishes.
+Production runs are **in-task** (`MIDKERNEL_AGENTFLOW_TARGET=local`, shared disk). Graph emit (`python pipelines/*.py`, `agentflow validate`) is side-effect free: it prints PipelineSpec JSON and does not write disk or S3. Per-node I/O bootstraps when a run is actually executing — `WORKDIR` already exists and is writable, and either `RUN_ID` is set or `MIDKERNEL_NODE_IO=1`. Then `graph.json` is seeded and each node's prompt is uploaded. Shell wraps `mkdir -p "$WORKDIR"` **before** the I/O gate (prepare used to create the dir only inside the inner script). Kimi `executable` is this repo's `pipelines/_node_io.py` (always present at in-task emit), not `$WORKDIR/.midkernel/node_io.py` alone. Failed / disabled I/O and S3 PutObject errors print to stderr. Dynamic hunters (`hunter-1`…`N` from `GOAL_COUNT`) are first-class: present in `graph.json` with edges `surface-split → hunter-N → judge-a`, and re-spawned (idempotent) when `surface-split` finishes.
+
+### Runner / app follow-up (required for the next ECS GOAL run)
+
+Playbooks can only write `graph.json` when the Python graph actually runs. Today that does not happen on ECS.
+
+**midkernel/runner** ([#4](https://github.com/midkernel/runner/pull/4)) must, when `pipelines/${PLAYBOOK}.py` exists (clone `midkernel/playbooks` or bake it):
+
+1. Export `WORKDIR=/workspace`, `OUTPUTS_DIR=/outputs`, `MIDKERNEL_NODE_IO=1`, `MIDKERNEL_AGENTFLOW_TARGET=local`, `MIDKERNEL_KIMI_BIN=/opt/midkernel/kimi.bin`.
+2. `mkdir -p "$WORKDIR" "$OUTPUTS_DIR"` before `agentflow run`.
+3. Exec `scripts/ecs-in-task.sh` (or `agentflow run pipelines/${PLAYBOOK}.py`).
+4. Stop using `midkernel-default` / `midkernel-runner` (single kimi + `<slug>.md`) for playbooks that have a `pipelines/*.py` graph.
+
+**midkernel/app** already sets `RUN_ID`, `PLAYBOOK`, `GOAL_COUNT`, artifacts, and hashes the pipeline as `sha256(text.trim())` (so `pipelineSha` will not match raw `sha256sum` of the file). Also set `MIDKERNEL_NODE_IO=1`, `MIDKERNEL_AGENTFLOW_TARGET=local`, `WORKDIR=/workspace` on the task env. Optional: command-override the container to `scripts/ecs-in-task.sh` instead of relying on image `CMD`.
 
 Deviation vs a purely dynamic agentflow fan-out: agentflow still needs the hunter copies declared when the graph is emitted. `GOAL_COUNT` is read then (task env), so N is exact for that run. Hunters are marked `dynamic: true` for the UI. The published ECS-per-node path (`MIDKERNEL_AGENTFLOW_TARGET=ecs`) still embeds the helper in each shell script; Kimi I/O there requires the helper file on the task disk (the in-task path is the one Midkernel actually launches).
 

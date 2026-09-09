@@ -71,6 +71,8 @@ def test_security_review_graph_is_kimi_openrouter_on_midkernel_ecs() -> None:
 
     review = nodes["review"]
     assert review["executable"].endswith("node_io.py")
+    assert Path(review["executable"]).name == "_node_io.py"
+    assert Path(review["executable"]).is_file()
     assert review["env"]["MIDKERNEL_NODE_ID"] == "review"
     assert review["agent"] == "kimi"
     assert review["provider"]["name"] == "openrouter"
