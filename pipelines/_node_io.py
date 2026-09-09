@@ -17,11 +17,14 @@ Progress is ``{completed, total, percent, etaSeconds}``. Dynamic hunters
 ``graph.json`` when the graph is initialized and again when ``surface-split``
 finishes (idempotent), with edges ``surface-split → hunter-N → judge-a``.
 
-This module is stdlib + optional ``boto3``. It is copied onto the shared task
-disk at graph emit / prepare so in-task nodes (``MIDKERNEL_AGENTFLOW_TARGET=local``)
-can upload without importing ``pipelines``. Shell nodes wrap start/finish around
-the existing script. Kimi nodes set ``executable`` to this file so the same
-process uploads prompt at start and output + meta on success or failure.
+This module is stdlib + optional ``boto3``. The helper is copied onto the
+shared task disk only when a run is actually executing so in-task nodes
+(``MIDKERNEL_AGENTFLOW_TARGET=local``) can upload without importing
+``pipelines``. Graph emit / ``agentflow validate`` stay side-effect free:
+no disk or S3 writes unless ``node_io_enabled()``. Shell nodes wrap
+start/finish around the existing script. Kimi nodes set ``executable`` to
+this file so the same process uploads prompt at start and output + meta on
+success or failure.
 
 Final ``report.md`` still uses the existing publish stub-refusal path.
 """
@@ -74,6 +77,30 @@ def env_first(*names: str, default: str = "") -> str:
 
 def workdir() -> str:
     return os.environ.get("WORKDIR", "/workspace").rstrip("/") or "/workspace"
+
+
+def workdir_is_writable() -> bool:
+    """True when WORKDIR already exists and is writable. Never creates it."""
+    try:
+        path = Path(workdir())
+        return path.is_dir() and os.access(path, os.W_OK)
+    except OSError:
+        return False
+
+
+def node_io_enabled() -> bool:
+    """Whether per-node I/O may touch disk or S3.
+
+    On only for a real run: ``MIDKERNEL_NODE_IO=1`` (ECS prepare/runtime) or
+    ``RUN_ID`` is set, **and** WORKDIR exists and is writable. Explicit
+    ``MIDKERNEL_NODE_IO=0`` disables writes. Graph emit and CI validate
+    must stay side-effect free — this never creates ``/workspace``.
+    """
+    flag = env_first("MIDKERNEL_NODE_IO").lower()
+    if flag in {"0", "false", "no", "off"}:
+        return False
+    requested = flag in {"1", "true", "yes", "on"} or bool(run_id())
+    return requested and workdir_is_writable()
 
 
 def repo_dir() -> str:
@@ -235,6 +262,8 @@ def skip_s3() -> bool:
 
 def put_bytes(key: str, body: bytes, *, content_type: str | None = None) -> None:
     """Write a local mirror always; PutObject when RUN_ID is set."""
+    if not node_io_enabled():
+        return
     ctype = content_type or content_type_for_key(key)
     mirror = artifacts_mirror_dir() / key
     mirror.parent.mkdir(parents=True, exist_ok=True)
@@ -309,7 +338,14 @@ def compute_progress(nodes: list[dict[str, Any]], *, now: str | None = None) -> 
     }
 
 
+class _NullLock:
+    def close(self) -> None:
+        return None
+
+
 def _with_graph_lock() -> Any:
+    if not node_io_enabled():
+        return _NullLock()
     runtime_dir().mkdir(parents=True, exist_ok=True)
     handle = lock_path().open("a+")
     fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
@@ -336,6 +372,8 @@ def load_graph() -> dict[str, Any]:
 def save_graph(graph: dict[str, Any]) -> dict[str, Any]:
     graph["progress"] = compute_progress(list(graph.get("nodes") or []))
     graph["updatedAt"] = utc_now()
+    if not node_io_enabled():
+        return graph
     local_state_path().parent.mkdir(parents=True, exist_ok=True)
     local_state_path().write_text(json.dumps(graph, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     put_json(graph_key(), graph)
@@ -401,6 +439,8 @@ def graph_node_record(
 
 def init_graph(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> dict[str, Any]:
     """Create/replace live topology. Safe to call again (merges by id)."""
+    if not node_io_enabled():
+        return _empty_graph()
     lock = _with_graph_lock()
     try:
         graph = load_graph()
@@ -454,6 +494,8 @@ def spawn_hunters(
     model: str | None = None,
 ) -> dict[str, Any]:
     """Add hunter-1..N as first-class dynamic nodes + edges. Idempotent."""
+    if not node_io_enabled():
+        return load_graph()
     n = max(1, min(int(count), MAX_GOAL_HUNTERS))
     lock = _with_graph_lock()
     try:
@@ -482,6 +524,16 @@ def spawn_hunters(
 
 
 def update_node(node_id: str, **fields: Any) -> dict[str, Any]:
+    if not node_io_enabled():
+        return graph_node_record(
+            node_id,
+            kind=str(fields.get("kind") or "kimi"),
+            status=str(fields.get("status") or "pending"),
+            label=fields.get("label"),
+            parent_id=fields.get("parentId") or fields.get("parent_id"),
+            dynamic=fields.get("dynamic"),
+            model=fields.get("model"),
+        )
     lock = _with_graph_lock()
     try:
         graph = load_graph()
@@ -583,6 +635,8 @@ def start_node(
     dynamic: bool | None = None,
 ) -> dict[str, Any]:
     nid = safe_node_id(node_id)
+    if not node_io_enabled():
+        return {}
     started = utc_now()
     if prompt is not None:
         put_text(node_prompt_key(nid), prompt if prompt.endswith("\n") else f"{prompt}\n")
@@ -623,6 +677,8 @@ def finish_node(
     model: str | None = None,
 ) -> dict[str, Any]:
     nid = safe_node_id(node_id)
+    if not node_io_enabled():
+        return {}
     if status not in {"completed", "failed"}:
         status = "failed"
     finished = utc_now()
@@ -658,8 +714,10 @@ def finish_node(
     return record
 
 
-def install_runtime() -> Path:
+def install_runtime() -> Path | None:
     dest = runtime_script_path()
+    if not node_io_enabled():
+        return None
     dest.parent.mkdir(parents=True, exist_ok=True)
     source = Path(__file__).read_text(encoding="utf-8")
     dest.write_text(source, encoding="utf-8")
@@ -668,7 +726,13 @@ def install_runtime() -> Path:
 
 
 def bootstrap_run_io(payload: dict[str, Any]) -> dict[str, Any]:
-    """Write the in-task helper and seed graph.json + per-node prompts."""
+    """Install the helper and seed graph.json + prompts when a run is live.
+
+    No-op (no disk / S3) unless ``node_io_enabled()`` — graph emit and
+    ``agentflow validate`` stay side-effect free.
+    """
+    if not node_io_enabled():
+        return _empty_graph()
     install_runtime()
     nodes, edges = graph_from_pipeline(payload)
     graph = init_graph(nodes, edges)
@@ -700,6 +764,7 @@ def wrap_shell_script(
     dyn = "1" if (is_dynamic_node(nid) if dynamic is None else dynamic) else ""
     parent = parent_id or ("surface-split" if is_dynamic_node(nid) else "")
     prompt_b64 = base64.b64encode(script.encode("utf-8")).decode("ascii")
+    helper_src = str(Path(__file__).resolve())
     return f"""
 set -euo pipefail
 WORKDIR="${{WORKDIR:-/workspace}}"
@@ -713,14 +778,35 @@ export MIDKERNEL_NODE_OUTPUTS={_bash_single(",".join(outputs))}
 export MIDKERNEL_NODE_MODEL={_bash_single(model or "")}
 export MIDKERNEL_NODE_PARENT={_bash_single(parent)}
 export MIDKERNEL_NODE_DYNAMIC={_bash_single(dyn)}
-mkdir -p "$IO_DIR/nodes/$NODE_ID"
-LOG="$IO_DIR/nodes/$NODE_ID/stdout.log"
-PROMPT_FILE="$IO_DIR/nodes/$NODE_ID/prompt.md"
-python3 -c "import base64,pathlib; pathlib.Path('$PROMPT_FILE').write_bytes(base64.b64decode('{prompt_b64}'))"
-if [ ! -f "$IO" ]; then
-  echo "node io helper missing at $IO (emit should have written it); skipping per-node upload" >&2
-else
-  python3 "$IO" start --node "$NODE_ID" --kind {_bash_single(kind)} --label {_bash_single(label_text)} --prompt-file "$PROMPT_FILE" || true
+LOG="/dev/null"
+PROMPT_FILE=""
+# Disk / S3 I/O only on a real run (writable WORKDIR + RUN_ID or MIDKERNEL_NODE_IO=1).
+NODE_IO=0
+case "${{MIDKERNEL_NODE_IO:-}}" in
+  0|false|no|off|FALSE|NO|OFF) NODE_IO=0 ;;
+  1|true|yes|on|TRUE|YES|ON) NODE_IO=1 ;;
+  *)
+    if [ -n "${{RUN_ID:-}}" ]; then NODE_IO=1; fi
+    ;;
+esac
+if [ "$NODE_IO" = "1" ] && [ -d "$WORKDIR" ] && [ -w "$WORKDIR" ]; then
+  export MIDKERNEL_NODE_IO=1
+  mkdir -p "$IO_DIR/nodes/$NODE_ID"
+  LOG="$IO_DIR/nodes/$NODE_ID/stdout.log"
+  PROMPT_FILE="$IO_DIR/nodes/$NODE_ID/prompt.md"
+  python3 -c "import base64,pathlib; pathlib.Path('$PROMPT_FILE').write_bytes(base64.b64decode('{prompt_b64}'))"
+  if [ ! -f "$IO" ]; then
+    SRC={_bash_single(helper_src)}
+    if [ -f "$SRC" ]; then
+      cp "$SRC" "$IO"
+      chmod 755 "$IO" || true
+    fi
+  fi
+  if [ -f "$IO" ]; then
+    python3 "$IO" start --node "$NODE_ID" --kind {_bash_single(kind)} --label {_bash_single(label_text)} --prompt-file "$PROMPT_FILE" || true
+  else
+    echo "node io helper missing at $IO; skipping per-node upload" >&2
+  fi
 fi
 set +e
 (
@@ -729,7 +815,7 @@ set -euo pipefail
 ) 2>&1 | tee "$LOG"
 STATUS=${{PIPESTATUS[0]}}
 set -e
-if [ -f "$IO" ]; then
+if [ -n "$PROMPT_FILE" ] && [ -f "$IO" ]; then
   if [ "$STATUS" -eq 0 ]; then
     python3 "$IO" finish --node "$NODE_ID" --status completed || true
   else
@@ -761,6 +847,7 @@ def kimi_io_env(
         "MIDKERNEL_NODE_KIND": "kimi",
         "MIDKERNEL_NODE_LABEL": label or node_label(nid),
         "MIDKERNEL_NODE_OUTPUTS": ",".join(outputs or []),
+        "MIDKERNEL_NODE_IO": "1",
     }
     if model:
         env["MIDKERNEL_NODE_MODEL"] = model
@@ -804,6 +891,8 @@ def _prompt_from_kimi_argv(argv: list[str]) -> str:
 def wrap_kimi(argv: list[str]) -> int:
     node_id = env_first("MIDKERNEL_NODE_ID") or "kimi"
     prompt = _prompt_from_kimi_argv(argv)
+    if node_io_enabled():
+        install_runtime()
     start_node(
         node_id,
         prompt=prompt,

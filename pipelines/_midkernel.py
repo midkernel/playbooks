@@ -382,6 +382,7 @@ case "$OPENROUTER_MODEL" in
 esac
 
 mkdir -p "$WORKDIR" "$OUTPUTS_DIR" "$HOME/.kimi"
+export MIDKERNEL_NODE_IO="${MIDKERNEL_NODE_IO:-1}"
 
 python3 - "$OPENROUTER_SECRET_ID" "$GITHUB_TOKEN_SECRET_ID" "$AWS_REGION" <<'PY'
 import json, os, sys
@@ -554,6 +555,7 @@ def build_scan_graph(slug: str, *, description: str):
 
 def emit(slug: str, *, description: str) -> None:
     graph = build_scan_graph(slug, description=description)
+    # No disk/S3 during validate; bootstrap is a no-op unless a run is live.
     bootstrap_run_io(graph.to_payload())
     print(graph.to_json())
 
@@ -898,6 +900,7 @@ def build_goal_scan_graph(slug: str, *, description: str):
 
 def emit_goal(slug: str, *, description: str) -> None:
     graph = build_goal_scan_graph(slug, description=description)
+    # No disk/S3 during validate; bootstrap is a no-op unless a run is live.
     bootstrap_run_io(graph.to_payload())
     print(graph.to_json())
 

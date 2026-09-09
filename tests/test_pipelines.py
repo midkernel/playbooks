@@ -43,6 +43,8 @@ pytest.importorskip("agentflow")
 def _load(slug: str, env: dict[str, str] | None = None) -> dict:
     merged = os.environ.copy()
     merged.pop("MIDKERNEL_AGENTFLOW_TARGET", None)
+    merged.pop("RUN_ID", None)
+    merged["MIDKERNEL_NODE_IO"] = "0"
     if env:
         merged.update(env)
     result = subprocess.run(

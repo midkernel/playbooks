@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import os
+import json
 from pathlib import Path
 
 import pytest
@@ -186,3 +186,30 @@ def test_review_prompt_names_default_targets() -> None:
     assert "`main`" in firedancer
     assert "sanitizer" in firedancer.lower()
     assert "agave/" in firedancer
+
+
+def test_emit_is_side_effect_free_without_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pytest.importorskip("agentflow")
+    monkeypatch.setenv("WORKDIR", str(tmp_path))
+    monkeypatch.delenv("RUN_ID", raising=False)
+    monkeypatch.delenv("MIDKERNEL_NODE_IO", raising=False)
+    mk.emit("security-review", description="validate only")
+    assert not (tmp_path / ".midkernel").exists()
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["name"] == "security-review"
+    assert payload["nodes"]
+
+
+def test_emit_goal_is_side_effect_free_without_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pytest.importorskip("agentflow")
+    monkeypatch.setenv("WORKDIR", str(tmp_path))
+    monkeypatch.delenv("RUN_ID", raising=False)
+    monkeypatch.delenv("MIDKERNEL_NODE_IO", raising=False)
+    mk.emit_goal("goal-security-review", description="validate only")
+    assert not (tmp_path / ".midkernel").exists()
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["name"] == "goal-security-review"

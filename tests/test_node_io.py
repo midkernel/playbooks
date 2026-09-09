@@ -163,6 +163,51 @@ def test_wrap_shell_script_keeps_body_and_uploads(io_home: Path) -> None:
     assert "python3" in wrapped
     assert "finish" in wrapped
     assert "failed" in wrapped
+    assert "MIDKERNEL_NODE_IO" in wrapped
+    assert "RUN_ID" in wrapped
+
+
+def test_node_io_disabled_without_run_or_flag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("WORKDIR", str(tmp_path))
+    monkeypatch.delenv("RUN_ID", raising=False)
+    monkeypatch.delenv("MIDKERNEL_NODE_IO", raising=False)
+    monkeypatch.delenv("MIDKERNEL_IO_DIR", raising=False)
+    assert io.node_io_enabled() is False
+    assert io.install_runtime() is None
+    graph = io.bootstrap_run_io(
+        {"name": "security-review", "nodes": [{"id": "prepare", "agent": "shell", "prompt": "x"}]}
+    )
+    assert graph["nodes"] == []
+    assert not (tmp_path / ".midkernel").exists()
+
+
+def test_node_io_disabled_when_workdir_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    missing = "/this-workdir-does-not-exist-midkernel-io"
+    monkeypatch.setenv("WORKDIR", missing)
+    monkeypatch.setenv("RUN_ID", "run-ci")
+    monkeypatch.setenv("MIDKERNEL_NODE_IO", "1")
+    assert not Path(missing).exists()
+    assert io.node_io_enabled() is False
+    io.bootstrap_run_io({"name": "x", "nodes": []})
+    assert not Path(missing).exists()
+
+
+def test_node_io_explicit_off_even_with_run(io_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MIDKERNEL_NODE_IO", "0")
+    assert io.node_io_enabled() is False
+    assert io.install_runtime() is None
+    assert not (io_home / ".midkernel" / "node_io.py").exists()
+
+
+def test_node_io_explicit_on_without_run_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("WORKDIR", str(tmp_path))
+    monkeypatch.setenv("MIDKERNEL_NODE_IO", "1")
+    monkeypatch.setenv("MIDKERNEL_IO_SKIP_S3", "1")
+    monkeypatch.setenv("MIDKERNEL_IO_DIR", str(tmp_path / "s3"))
+    monkeypatch.delenv("RUN_ID", raising=False)
+    assert io.node_io_enabled() is True
+    dest = io.install_runtime()
+    assert dest is not None and dest.is_file()
 
 
 def test_utc_now_is_zulu() -> None:
