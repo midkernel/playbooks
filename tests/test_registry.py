@@ -87,3 +87,8 @@ def test_readme_documents_openrouter_lock_and_default_targets() -> None:
     assert "--version" in readme
     assert "cmtuavpvs0003ib04bfyr7roc" in readme
     assert "sha256(text.trim())" in readme or "text.trim()" in readme
+    assert "cmtun51000003l704q7lyyjrf" in readme
+    assert "openrouter_new_account" in readme
+    assert "20 requests/minute" in readme
+    assert "429" in readme
+    assert "serialized" in readme.lower() or "depends_on" in readme

@@ -15,7 +15,10 @@ S3 layout (bucket default ``midkernel-dev-artifacts``; prefix default ``runs/``)
 Progress is ``{completed, total, percent, etaSeconds}``. Dynamic hunters
 (``hunter-1``…``hunter-N`` from ``GOAL_COUNT``) are first-class: spawned into
 ``graph.json`` when the graph is initialized and again when ``surface-split``
-finishes (idempotent), with edges ``surface-split → hunter-N → judge-a``.
+finishes (idempotent), with a serialized chain
+``surface-split → hunter-1 → hunter-2 → … → hunter-N`` and each hunter also
+edging to ``judge-a``. Parallel fan-out is the 429 root cause
+(run ``cmtun51000003l704q7lyyjrf``).
 
 This module is stdlib + optional ``boto3``. The helper is copied onto the
 shared task disk only when a run is actually executing so in-task nodes
@@ -42,7 +45,9 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -75,6 +80,13 @@ MAX_TOKENS_ENV_NAMES = (
     "KIMI_MODEL_MAX_TOKENS",
     "KIMI_MODEL_MAX_COMPLETION_TOKENS",
 )
+# Defense in depth for OpenRouter 429 RPM (new-account 20 req/min on
+# moonshotai/kimi-k3, run cmtun51000003l704q7lyyjrf). Serialization of GOAL
+# hunters is the primary fix; these retries cover a transient in-node burst.
+DEFAULT_OPENROUTER_429_RETRIES = 4
+MAX_OPENROUTER_429_RETRIES = 8
+OPENROUTER_429_BACKOFF_BASE_SECONDS = 1.0
+OPENROUTER_429_BACKOFF_CAP_SECONDS = 32.0
 NODE_STATUSES = ("pending", "running", "completed", "failed")
 SAFE_NODE_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 SAFE_RUN_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
@@ -279,6 +291,57 @@ def _is_chat_completions_path(path: str) -> bool:
     return "chat/completions" in (path or "").split("?", 1)[0]
 
 
+def _sleep(seconds: float) -> None:
+    """Indirection so tests can record backoff without waiting."""
+    time.sleep(float(seconds))
+
+
+def openrouter_429_retries() -> int:
+    raw = env_first("MIDKERNEL_OPENROUTER_429_RETRIES")
+    if raw:
+        try:
+            return max(0, min(MAX_OPENROUTER_429_RETRIES, int(raw)))
+        except ValueError:
+            pass
+    return DEFAULT_OPENROUTER_429_RETRIES
+
+
+def parse_retry_after(value: str | None, *, now: datetime | None = None) -> float | None:
+    """Parse ``Retry-After`` as delta-seconds or HTTP-date. ``None`` if unusable."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return max(0.0, float(text))
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(text)
+    except (TypeError, ValueError, OverflowError, IndexError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    stamp = now if now is not None else datetime.now(timezone.utc)
+    return max(0.0, (when - stamp).total_seconds())
+
+
+def openrouter_429_delay_seconds(attempt: int, retry_after: str | None = None) -> float:
+    """Seconds to wait before retry *attempt* (0-based). Prefer Retry-After."""
+    parsed = parse_retry_after(retry_after)
+    if parsed is not None:
+        return min(parsed, OPENROUTER_429_BACKOFF_CAP_SECONDS)
+    exp = OPENROUTER_429_BACKOFF_BASE_SECONDS * (2 ** max(0, int(attempt)))
+    return min(exp, OPENROUTER_429_BACKOFF_CAP_SECONDS)
+
+
+def should_retry_openrouter(status: int, attempt: int, retries: int | None = None) -> bool:
+    """Retry only HTTP 429, and only while *attempt* is still under the cap."""
+    limit = openrouter_429_retries() if retries is None else int(retries)
+    return int(status) == 429 and 0 <= int(attempt) < max(0, limit)
+
+
 class OpenRouterMaxTokensProxy:
     """Local reverse proxy that injects ``max_tokens`` on OpenRouter calls.
 
@@ -286,13 +349,26 @@ class OpenRouterMaxTokensProxy:
     ``KIMI_MODEL_MAX_COMPLETION_TOKENS`` or ``max_output_size`` — those apply
     to the native Kimi / Anthropic providers. The 402 is on the HTTP body
     OpenRouter actually receives, so wrap_kimi must clamp that body.
+
+    429 responses are retried (Retry-After or exponential backoff) so a
+    transient RPM hit does not hard-fail the node. Serialization of GOAL
+    hunters is the primary 429 fix; this is defense in depth.
     """
 
-    def __init__(self, cap: int | None = None, *, upstream_base: str = OPENROUTER_BASE_URL) -> None:
+    def __init__(
+        self,
+        cap: int | None = None,
+        *,
+        upstream_base: str = OPENROUTER_BASE_URL,
+        retries: int | None = None,
+    ) -> None:
         self.cap = clamp_kimi_max_tokens(
             DEFAULT_KIMI_MAX_TOKENS if cap is None else int(cap)
         )
         self.upstream_base = upstream_base.rstrip("/")
+        self.retries = (
+            openrouter_429_retries() if retries is None else max(0, min(MAX_OPENROUTER_429_RETRIES, int(retries)))
+        )
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -327,27 +403,44 @@ class OpenRouterMaxTokensProxy:
                 }
                 headers["Host"] = host
                 headers["Content-Length"] = str(len(raw))
-                conn: http.client.HTTPConnection
-                if scheme == "https":
-                    conn = http.client.HTTPSConnection(host, port, timeout=600)
-                else:
-                    conn = http.client.HTTPConnection(host, port, timeout=600)
-                try:
-                    conn.request(self.command, path, body=raw if raw else None, headers=headers)
-                    upstream = conn.getresponse()
-                    self.send_response(upstream.status)
-                    for key, value in upstream.getheaders():
-                        if key.lower() in {"transfer-encoding", "connection", "keep-alive"}:
+                attempt = 0
+                while True:
+                    conn: http.client.HTTPConnection
+                    if scheme == "https":
+                        conn = http.client.HTTPSConnection(host, port, timeout=600)
+                    else:
+                        conn = http.client.HTTPConnection(host, port, timeout=600)
+                    try:
+                        conn.request(
+                            self.command, path, body=raw if raw else None, headers=headers
+                        )
+                        upstream = conn.getresponse()
+                        if should_retry_openrouter(upstream.status, attempt, proxy.retries):
+                            retry_after = upstream.getheader("Retry-After")
+                            upstream.read()
+                            delay = openrouter_429_delay_seconds(attempt, retry_after)
+                            print(
+                                f"node io: OpenRouter 429 retry {attempt + 1}/{proxy.retries} "
+                                f"sleep={delay}s retry_after={retry_after or '-'}",
+                                file=sys.stderr,
+                            )
+                            attempt += 1
+                            _sleep(delay)
                             continue
-                        self.send_header(key, value)
-                    self.end_headers()
-                    while True:
-                        chunk = upstream.read(65536)
-                        if not chunk:
-                            break
-                        self.wfile.write(chunk)
-                finally:
-                    conn.close()
+                        self.send_response(upstream.status)
+                        for key, value in upstream.getheaders():
+                            if key.lower() in {"transfer-encoding", "connection", "keep-alive"}:
+                                continue
+                            self.send_header(key, value)
+                        self.end_headers()
+                        while True:
+                            chunk = upstream.read(65536)
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                        return
+                    finally:
+                        conn.close()
 
             def do_GET(self) -> None:  # noqa: N802
                 self._forward()
@@ -866,13 +959,19 @@ def spawn_hunters(
     target: str = "judge-a",
     model: str | None = None,
 ) -> dict[str, Any]:
-    """Add hunter-1..N as first-class dynamic nodes + edges. Idempotent."""
+    """Add hunter-1..N as first-class dynamic nodes + serialized edges. Idempotent.
+
+    Edges are ``source → hunter-1 → hunter-2 → … → hunter-N`` plus each hunter
+    → *target* (judge-a). Do not fan out every hunter from ``surface-split`` —
+    that parallel burst is the 429 (run ``cmtun51000003l704q7lyyjrf``).
+    """
     if not node_io_enabled():
         return load_graph()
     n = max(1, min(int(count), MAX_GOAL_HUNTERS))
     lock = _with_graph_lock()
     try:
         graph = load_graph()
+        predecessor = source
         for index in range(1, n + 1):
             nid = f"hunter-{index}"
             existing = next((node for node in graph.get("nodes") or [] if node.get("id") == nid), None)
@@ -889,8 +988,9 @@ def spawn_hunters(
                     if existing.get(key):
                         record[key] = existing[key]
             _upsert_node(graph, record)
-            _upsert_edge(graph, source, nid)
+            _upsert_edge(graph, predecessor, nid)
             _upsert_edge(graph, nid, target)
+            predecessor = nid
         return save_graph(graph)
     finally:
         lock.close()
@@ -1656,7 +1756,7 @@ def wrap_kimi(argv: list[str]) -> int:
     if code != 0 and not error:
         error = f"exit {code}"
     # Upload files the model actually wrote (RESULT.md / report.md / …).
-    # Never invent hunter findings or a stub RESULT.md on 402 / empty return.
+    # Never invent hunter findings or a stub RESULT.md on 402 / 429 / empty return.
     finish_node(node_id, status=status, error=error, outputs=parse_outputs(None))
     return code
 

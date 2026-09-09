@@ -40,6 +40,30 @@ GOAL_NODES = (
 pytest.importorskip("agentflow")
 
 
+def _assert_goal_hunters_serialized(nodes: dict, count: int) -> None:
+    """hunter-1 depends on surface-split; hunter-k depends on hunter-(k-1).
+
+    After surface-split completes, only hunter-1 is ready. That is the
+    OpenRouter 429 fix (run cmtun51000003l704q7lyyjrf): do not fan out.
+    """
+    assert nodes["hunter-1"]["depends_on"] == ["surface-split"]
+    for index in range(2, count + 1):
+        assert nodes[f"hunter-{index}"]["depends_on"] == [f"hunter-{index - 1}"]
+    ready_after_split = [
+        f"hunter-{index}"
+        for index in range(1, count + 1)
+        if set(nodes[f"hunter-{index}"]["depends_on"]) <= {"surface-split"}
+    ]
+    assert ready_after_split == ["hunter-1"]
+    for left in range(1, count + 1):
+        for right in range(left + 1, count + 1):
+            assert f"hunter-{left}" not in set(nodes[f"hunter-{right}"]["depends_on"]) or right == left + 1
+            assert not (
+                set(nodes[f"hunter-{left}"]["depends_on"]) <= {"surface-split"}
+                and set(nodes[f"hunter-{right}"]["depends_on"]) <= {"surface-split"}
+            )
+
+
 def _load(slug: str, env: dict[str, str] | None = None) -> dict:
     merged = os.environ.copy()
     merged.pop("MIDKERNEL_AGENTFLOW_TARGET", None)
@@ -173,12 +197,13 @@ def test_goal_security_review_graph_nodes_and_openrouter_lock() -> None:
     assert tuple(nodes) == GOAL_NODES or set(nodes) == set(GOAL_NODES)
     assert set(nodes) == set(GOAL_NODES)
 
+    assert spec["concurrency"] == 1
     assert nodes["threat-model"]["depends_on"] == ["prepare"]
     assert nodes["goal-author"]["depends_on"] == ["threat-model"]
     assert nodes["surface-split"]["depends_on"] == ["goal-author"]
+    _assert_goal_hunters_serialized(nodes, 6)
     for index in range(1, 7):
         hunter = nodes[f"hunter-{index}"]
-        assert hunter["depends_on"] == ["surface-split"]
         assert hunter["agent"] == "kimi"
         assert hunter["provider"]["name"] == "openrouter"
         assert f"goals/{index:02d}-" in hunter["prompt"]
@@ -272,9 +297,25 @@ def test_goal_security_review_hunters_follow_goal_count() -> None:
         "assemble",
         "publish",
     }
-    assert nodes["hunter-1"]["depends_on"] == ["surface-split"]
-    assert nodes["hunter-2"]["depends_on"] == ["surface-split"]
+    _assert_goal_hunters_serialized(nodes, 2)
+    assert spec["concurrency"] == 1
     assert set(nodes["judge-a"]["depends_on"]) == {"hunter-1", "hunter-2"}
+
+
+def test_goal_security_review_hunters_are_serialized_not_fanned_out() -> None:
+    """Parallel hunter-1..6 is the OpenRouter 429 RPM root cause."""
+    spec = _load(GOAL_SLUG)
+    nodes = {node["id"]: node for node in spec["nodes"]}
+    assert spec["concurrency"] == 1
+    _assert_goal_hunters_serialized(nodes, 6)
+    for index in range(1, 7):
+        deps = nodes[f"hunter-{index}"]["depends_on"]
+        assert len(deps) == 1
+        if index == 1:
+            assert deps == ["surface-split"]
+        else:
+            assert deps == [f"hunter-{index - 1}"]
+            assert "surface-split" not in deps
 
 
 def test_goal_security_review_local_in_task_override() -> None:
