@@ -699,7 +699,6 @@ def wrap_shell_script(
     label_text = label or node_label(nid)
     dyn = "1" if (is_dynamic_node(nid) if dynamic is None else dynamic) else ""
     parent = parent_id or ("surface-split" if is_dynamic_node(nid) else "")
-    encoded = base64.b64encode(Path(__file__).read_bytes()).decode("ascii")
     prompt_b64 = base64.b64encode(script.encode("utf-8")).decode("ascii")
     return f"""
 set -euo pipefail
@@ -715,14 +714,14 @@ export MIDKERNEL_NODE_MODEL={_bash_single(model or "")}
 export MIDKERNEL_NODE_PARENT={_bash_single(parent)}
 export MIDKERNEL_NODE_DYNAMIC={_bash_single(dyn)}
 mkdir -p "$IO_DIR/nodes/$NODE_ID"
-if [ ! -f "$IO" ]; then
-  python3 -c "import base64,pathlib; pathlib.Path('$IO').write_bytes(base64.b64decode('{encoded}'))"
-  chmod +x "$IO"
-fi
 LOG="$IO_DIR/nodes/$NODE_ID/stdout.log"
 PROMPT_FILE="$IO_DIR/nodes/$NODE_ID/prompt.md"
 python3 -c "import base64,pathlib; pathlib.Path('$PROMPT_FILE').write_bytes(base64.b64decode('{prompt_b64}'))"
-python3 "$IO" start --node "$NODE_ID" --kind {_bash_single(kind)} --label {_bash_single(label_text)} --prompt-file "$PROMPT_FILE" || true
+if [ ! -f "$IO" ]; then
+  echo "node io helper missing at $IO (emit should have written it); skipping per-node upload" >&2
+else
+  python3 "$IO" start --node "$NODE_ID" --kind {_bash_single(kind)} --label {_bash_single(label_text)} --prompt-file "$PROMPT_FILE" || true
+fi
 set +e
 (
 set -euo pipefail
@@ -730,10 +729,14 @@ set -euo pipefail
 ) 2>&1 | tee "$LOG"
 STATUS=${{PIPESTATUS[0]}}
 set -e
-if [ "$STATUS" -eq 0 ]; then
-  python3 "$IO" finish --node "$NODE_ID" --status completed || true
-else
-  python3 "$IO" finish --node "$NODE_ID" --status failed --error "exit $STATUS" || true
+if [ -f "$IO" ]; then
+  if [ "$STATUS" -eq 0 ]; then
+    python3 "$IO" finish --node "$NODE_ID" --status completed || true
+  else
+    python3 "$IO" finish --node "$NODE_ID" --status failed --error "exit $STATUS" || true
+  fi
+fi
+if [ "$STATUS" -ne 0 ]; then
   exit "$STATUS"
 fi
 """.strip()
