@@ -85,6 +85,9 @@ def test_kimi_max_tokens_default_and_env(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.delenv("OPENROUTER_MAX_TOKENS", raising=False)
     assert mk.kimi_max_tokens() == 65536
     # 131072 is the exact 402 reservation — not a valid opt-in.
+    # Clear higher-priority aliases so KIMI_MAX_TOKENS is the first-wins source.
+    for name in mk.MAX_TOKENS_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("KIMI_MAX_TOKENS", "131072")
     assert mk.kimi_max_tokens() == 32768
     monkeypatch.setenv("KIMI_MAX_TOKENS", "80000")
