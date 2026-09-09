@@ -77,6 +77,12 @@ def test_security_review_graph_is_kimi_openrouter_on_midkernel_ecs() -> None:
     assert review["env"]["MIDKERNEL_KIMI_BIN"]
     assert review["env"]["BASH_ENV"] == "/dev/null"
     assert review["env"]["MIDKERNEL_NODE_ID"] == "review"
+    assert review["env"]["OPENAI_BASE_URL"] == "https://openrouter.ai/api/v1"
+    assert review["env"]["KIMI_SHARE_DIR"].endswith(".midkernel/kimi")
+    assert review["extra_args"][0] == "--config"
+    assert review["extra_args"][1].endswith("config.toml")
+    assert "\n" not in review["extra_args"][1]
+    assert "default_model" not in review["extra_args"][1]
     assert review["agent"] == "kimi"
     assert review["provider"]["name"] == "openrouter"
     assert review["provider"]["base_url"] == "https://openrouter.ai/api/v1"
@@ -200,6 +206,18 @@ def test_goal_security_review_graph_nodes_and_openrouter_lock() -> None:
         assert os.access(hunter["executable"], os.X_OK)
         assert hunter["env"]["MIDKERNEL_KIMI_BIN"]
         assert hunter["env"]["BASH_ENV"] == "/dev/null"
+        assert hunter["env"]["OPENAI_BASE_URL"] == "https://openrouter.ai/api/v1"
+        assert hunter["env"]["KIMI_SHARE_DIR"].endswith(".midkernel/kimi")
+        assert hunter["extra_args"][0] == "--config"
+        assert hunter["extra_args"][1].endswith("config.toml")
+        assert "\n" not in hunter["extra_args"][1]
+
+    threat = nodes["threat-model"]
+    assert threat["env"]["OPENAI_BASE_URL"] == "https://openrouter.ai/api/v1"
+    assert threat["env"]["KIMI_SHARE_DIR"].endswith(".midkernel/kimi")
+    assert threat["extra_args"][0] == "--config"
+    assert threat["extra_args"][1].endswith("config.toml")
+    assert "default_model" not in threat["extra_args"][1]
 
     assert nodes["judge-a"]["model"] == "moonshotai/kimi-k3"
     assert nodes["judge-b"]["model"] != nodes["judge-a"]["model"]

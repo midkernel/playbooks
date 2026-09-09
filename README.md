@@ -121,7 +121,15 @@ Also export for Kimi OpenRouter (`openai_legacy`):
 export OPENAI_API_KEY="$OPENROUTER_API_KEY"
 export KIMI_API_KEY="$OPENROUTER_API_KEY"
 export OPENAI_BASE_URL="https://openrouter.ai/api/v1"
+export KIMI_SHARE_DIR="$WORKDIR/.midkernel/kimi"
 ```
+
+In-task Kimi nodes (`executable` = `pipelines/_node_io.py`) set `BASH_ENV=/dev/null` so the runner `node-env.sh` hook does not re-clone. That skips runner `prepare_node` on review / threat-model / hunters. Playbooks therefore:
+
+1. Bake `OPENAI_BASE_URL`, `OPENROUTER_MODEL`, `KIMI_SHARE_DIR`, `HOME`, and any emit-time OpenRouter keys onto **every** Kimi node env (`kimi_io_env` / `openrouter_node_env`).
+2. Pass `extra_args=["--config", "$WORKDIR/.midkernel/kimi/config.toml"]` — a **file path**. Inline TOML made kimi.bin print `LLM not set` (runs `cmtudf0470003jp040742shv6`, `cmtudm8f20003i90462yr3vxq`).
+3. `wrap_kimi` rewrites a non-file `--config`, writes that TOML, and forwards the OpenRouter env to `MIDKERNEL_KIMI_BIN`.
+4. Prepare also writes `$WORKDIR/.midkernel-openrouter` + `$WORKDIR/.midkernel/kimi/config.toml` (cwd for later nodes is `$WORKDIR/repo`).
 
 Harness secrets are never in git. Image/task role may `GetSecretValue` on the two SM names above and `PutObject` on the artifacts prefix (`runs/<RUN_ID>/` including `graph.json` and `nodes/<id>/`).
 
