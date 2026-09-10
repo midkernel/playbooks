@@ -225,6 +225,15 @@ def test_prepare_script_bakes_playbook_defaults() -> None:
     assert 'GITHUB_REF="${GITHUB_REF:-main}"' in firedancer
 
 
+def test_profile_timeout_seconds_low_is_30_minutes() -> None:
+    # Per-node kimi budget. QA cmtutkn8k0003id04hs5s8j7z: hunter-1 exit 124
+    # after 900s. Whole-run timeout is the runner's job; this table is per node.
+    assert mk.PROFILE_TIMEOUT_SECONDS["low"] == 30 * 60 == 1800
+    assert mk.PROFILE_TIMEOUT_SECONDS["balanced"] == 30 * 60
+    assert mk.PROFILE_TIMEOUT_SECONDS["max"] == 60 * 60
+    assert 900 not in mk.PROFILE_TIMEOUT_SECONDS.values()
+
+
 def test_goal_count_defaults_and_clamps(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("GOAL_COUNT", raising=False)
     assert mk.goal_count() == 6
@@ -296,6 +305,35 @@ def test_build_scan_graph_unchanged_shape(monkeypatch: pytest.MonkeyPatch) -> No
     assert "python3" in nodes["prepare"]["prompt"]
     assert "refusing to upload a stub" in nodes["publish"]["prompt"]
     assert "stub report" in nodes["publish"]["prompt"]
+
+
+def test_low_profile_goal_kimi_nodes_use_30_minute_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("agentflow")
+    monkeypatch.setenv("PROFILE", "low")
+    monkeypatch.setenv("GOAL_COUNT", "2")
+    graph = mk.build_goal_scan_graph(
+        "goal-security-review",
+        description="low profile per-node timeout",
+    )
+    nodes = {node["id"]: node for node in graph.to_payload()["nodes"]}
+    for task_id in (
+        "threat-model",
+        "goal-author",
+        "surface-split",
+        "hunter-1",
+        "hunter-2",
+        "judge-a",
+        "judge-b",
+        "assemble",
+    ):
+        assert nodes[task_id]["timeout_seconds"] == 1800
+    assert nodes["prepare"]["timeout_seconds"] == 10 * 60
+    assert nodes["publish"]["timeout_seconds"] == 5 * 60
+    assert nodes["hunter-1"]["depends_on"] == ["surface-split"]
+    assert nodes["hunter-2"]["depends_on"] == ["hunter-1"]
+    assert nodes["hunter-1"]["env"]["KIMI_MAX_TOKENS"] == "16384"
 
 
 def test_goal_graph_hunters_follow_goal_count(monkeypatch: pytest.MonkeyPatch) -> None:
