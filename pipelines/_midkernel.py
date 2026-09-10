@@ -147,3 +147,34 @@ PROFILE_TIMEOUT_SECONDS = {
     "balanced": 30 * 60,
     "max": 60 * 60,
 }
+
+_FRONTMATTER = re.compile(r"^---\r?\n[\s\S]*?\r?\n---\r?\n?")
+
+
+def workspace_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def workdir() -> str:
+    return os.environ.get("WORKDIR", "/workspace").rstrip("/") or "/workspace"
+
+
+def repo_dir() -> str:
+    return os.path.join(workdir(), "repo")
+
+
+def outputs_dir() -> str:
+    return os.environ.get("OUTPUTS_DIR", "/outputs").rstrip("/") or "/outputs"
+
+
+def env_first(*names: str, default: str = "") -> str:
+    for name in names:
+        value = (os.environ.get(name) or "").strip()
+        if value:
+            return value
+    return default
+
+
+def scan_profile() -> str:
+    profile = env_first("PROFILE", "SCAN_PROFILE", default="balanced").lower()
+    return profile if profile in PROFILE_FARGATE else "balanced"
