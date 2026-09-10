@@ -225,6 +225,18 @@ def test_prepare_script_bakes_playbook_defaults() -> None:
     assert 'GITHUB_REF="${GITHUB_REF:-main}"' in firedancer
 
 
+def test_profile_timeout_low_is_1800(monkeypatch: pytest.MonkeyPatch) -> None:
+    """QA cmtutkn8k0003id04hs5s8j7z: hunter-1 exit 124 after 900s."""
+    assert mk.PROFILE_TIMEOUT_SECONDS["low"] == 1800
+    assert mk.PROFILE_TIMEOUT_SECONDS["low"] == 30 * 60
+    assert mk.PROFILE_TIMEOUT_SECONDS["low"] == mk.PROFILE_TIMEOUT_SECONDS["balanced"]
+    assert mk.PROFILE_TIMEOUT_SECONDS["max"] == 60 * 60
+    monkeypatch.setenv("SCAN_PROFILE", "low")
+    monkeypatch.delenv("PROFILE", raising=False)
+    assert mk.scan_profile() == "low"
+    assert mk.PROFILE_TIMEOUT_SECONDS[mk.scan_profile()] == 1800
+
+
 def test_goal_count_defaults_and_clamps(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("GOAL_COUNT", raising=False)
     assert mk.goal_count() == 6
