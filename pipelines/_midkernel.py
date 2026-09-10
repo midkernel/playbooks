@@ -112,6 +112,8 @@ DEFAULT_TARGETS: dict[str, DefaultTarget] = {
 }
 
 # App container env (midkernel/app src/lib/agentflow-contract.ts).
+# Timeout overrides (AGENT_TIMEOUT_SECONDS / PROFILE_TIMEOUT_SECONDS /
+# NODE_TIMEOUT_SECONDS) are optional UI/app injections — see TIMEOUT_ENV_NAMES.
 AGENT_ENV_APP = (
     "RUN_ID",
     "GITHUB_OWNER",
@@ -139,10 +141,21 @@ PROFILE_FARGATE = {
     "max": {"cpu": "4096", "memory": "8192"},
 }
 
+# Hard per-node ECS / graph timeout. Soft agent deadline is 90% of whatever
+# hard value is used (profile table or env override). James lock 2026-09-10
+# (QA cmtuvv61w0003gm0az74grqv2): low 30m stays; balanced 1h; max 2h.
+# App / runner may inject AGENT_TIMEOUT_SECONDS (or PROFILE_TIMEOUT_SECONDS /
+# NODE_TIMEOUT_SECONDS) so the Scan UI can override. Soft recomputes from that.
+SOFT_DEADLINE_RATIO = 0.9
+TIMEOUT_ENV_NAMES = (
+    "AGENT_TIMEOUT_SECONDS",
+    "PROFILE_TIMEOUT_SECONDS",
+    "NODE_TIMEOUT_SECONDS",
+)
 PROFILE_TIMEOUT_SECONDS = {
     "low": 30 * 60,
-    "balanced": 30 * 60,
-    "max": 60 * 60,
+    "balanced": 60 * 60,
+    "max": 2 * 60 * 60,
 }
 
 _FRONTMATTER = re.compile(r"^---\r?\n[\s\S]*?\r?\n---\r?\n?")
@@ -175,6 +188,49 @@ def env_first(*names: str, default: str = "") -> str:
 def scan_profile() -> str:
     profile = env_first("PROFILE", "SCAN_PROFILE", default="balanced").lower()
     return profile if profile in PROFILE_FARGATE else "balanced"
+
+
+def hard_timeout_seconds(profile: str | None = None) -> int:
+    """Hard per-node timeout. Env overrides win so the app UI can set them."""
+    raw = env_first(*TIMEOUT_ENV_NAMES)
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError:
+            value = 0
+        if value > 0:
+            return value
+    return PROFILE_TIMEOUT_SECONDS[profile or scan_profile()]
+
+
+def soft_deadline_seconds(hard: int | None = None) -> int:
+    """Agent wall-clock budget: 90% of the resolved hard timeout."""
+    resolved = hard if hard is not None else hard_timeout_seconds()
+    return max(1, int(resolved * SOFT_DEADLINE_RATIO))
+
+
+def format_duration_seconds(seconds: int) -> str:
+    minutes, rem = divmod(int(seconds), 60)
+    if rem == 0:
+        label = "minute" if minutes == 1 else "minutes"
+        return f"{minutes} {label} ({seconds}s)"
+    return f"{seconds}s"
+
+
+def wall_clock_budget_prompt(
+    *,
+    hard: int | None = None,
+    required_outputs: str = "required output files",
+) -> str:
+    """Instruct the agent to finish before 90% of the hard node timeout."""
+    hard_s = hard if hard is not None else hard_timeout_seconds()
+    soft_s = soft_deadline_seconds(hard_s)
+    return (
+        f"Wall-clock budget (soft deadline): you have **{format_duration_seconds(soft_s)}** "
+        f"of agent time. The hard node timeout is {format_duration_seconds(hard_s)}. "
+        f"Finish early even if incomplete — write {required_outputs} before the soft "
+        f"deadline rather than getting killed with empty output.\n"
+    )
 
 
 def normalize_openrouter_model(raw: str, *, default: str = DEFAULT_OPENROUTER_MODEL) -> str:
@@ -359,6 +415,7 @@ def review_prompt(slug: str) -> str:
         "THREAT/THREAT_PIN from the environment. If THREAT is non-empty, "
         "prioritize that pin; it is not a fourth profile.\n"
         "- Hunt only: no bounty-submit, disclosure-program, or Immunefi filing language.\n\n"
+        f"{wall_clock_budget_prompt(required_outputs=f'**{REPORT_NAME}**')}\n"
         "Write the real review or triage to "
         f"**{REPORT_NAME}** in the workspace root of the cloned repo "
         f"(also copy it to {outputs_dir()}/{REPORT_NAME} if that directory exists).\n\n"
@@ -574,7 +631,7 @@ def build_scan_graph(slug: str, *, description: str):
 
     profile = scan_profile()
     model = openrouter_model()
-    timeout = PROFILE_TIMEOUT_SECONDS[profile]
+    timeout = hard_timeout_seconds(profile)
     prompt = review_prompt(slug)
     review_cwd = repo_dir() if agentflow_target_mode() == "local" else None
 
@@ -666,6 +723,7 @@ def goal_workspace_preamble(slug: str) -> str:
         "- Do not search local known-findings files or open GitHub issues/PRs for "
         "duplicates. That dedupe step is out of scope for this playbook.\n"
         f"- Final artifact is **{REPORT_NAME}**. The control plane uploads it to `{dest}`.\n"
+        f"{wall_clock_budget_prompt(required_outputs='the required output files for this node')}"
     )
 
 
@@ -711,7 +769,7 @@ def _kimi_scan_node(
         "env": env,
         "executable": kimi_executable(),
         "extra_args": kimi_extra_args(slug),
-        "timeout_seconds": timeout_seconds or PROFILE_TIMEOUT_SECONDS[scan_profile()],
+        "timeout_seconds": timeout_seconds if timeout_seconds is not None else hard_timeout_seconds(),
         "retries": 0,
         "target": node_target(cwd=cwd),
     }
@@ -802,7 +860,9 @@ def hunter_prompt(slug: str, index: int) -> str:
         "write evidence of what you actually read and tried.\n\n"
         "Write candidates under "
         f"**findings/{task_id}/** (one file per candidate, plus {result}). "
-        "RESULT.md must record candidates found or a clean miss with evidence.\n\n"
+        "RESULT.md must record candidates found or a clean miss with evidence. "
+        "Write RESULT.md before the soft deadline even if the hunt is incomplete — "
+        "a hard timeout with empty output fails this node and wastes the slot.\n\n"
         "Do not search local known-findings files or open GitHub issues/PRs for "
         "duplicates. Do not invent. Do not write report.md.\n"
     )
@@ -862,34 +922,41 @@ def assemble_prompt(slug: str) -> str:
     )
 
 
-def chain_goal_hunters(split, hunters) -> None:
-    """Serialize hunter-1..N: ``split → hunter-1 → hunter-2 → … → hunter-N``.
+def attach_goal_hunters(split, hunters) -> None:
+    """All hunters depend only on ``surface-split`` (siblings).
 
-    Parallel ``split >> hunters`` is the OpenRouter 429 root cause on new
-    accounts (20 RPM for ``moonshotai/kimi-k3``, run
-    ``cmtun51000003l704q7lyyjrf``, ``limit_source=openrouter_new_account``).
-    Agentflow has no hunter-group concurrency knob; a ``depends_on`` chain is
-    the supported way to keep one hunter on the wire at a time. Do not restore
-    the fan-out.
+    Serialization is ``Graph(concurrency=1)``, not a ``depends_on`` chain.
+    Agentflow skips a node when any ``depends_on`` parent is FAILED
+    (``upstream_failure``), even if ``fail_fast`` is False. Chaining
+    ``hunter-k >> hunter-(k+1)`` therefore aborts later hunters when hunter-k
+    times out (QA ``cmtuvv61w0003gm0az74grqv2``).
+
+    Do not raise ``concurrency`` on this fan-out — parallel hunters are the
+    OpenRouter 429 (run ``cmtun51000003l704q7lyyjrf``).
     """
-    if not hunters:
-        return
-    split >> hunters[0]
-    for earlier, later in zip(hunters, hunters[1:]):
-        earlier >> later
+    for hunter in hunters:
+        split >> hunter
+
+
+def chain_goal_hunters(split, hunters) -> None:
+    """Backward-compatible name. See ``attach_goal_hunters``."""
+    attach_goal_hunters(split, hunters)
 
 
 def build_goal_scan_graph(slug: str, *, description: str):
     """prepare → threat-model → goal-author → surface-split → hunters → judges → assemble → publish.
 
     Hunters are first-class dynamic nodes ``hunter-1``…``hunter-N`` from
-    ``GOAL_COUNT`` (default 6, max 6). They run as a ``depends_on`` chain
-    (never in parallel). Each picks ``goals/0N-*.md`` if present and no-ops
-    cleanly if missing. Known-issues / GitHub dedupe is omitted.
+    ``GOAL_COUNT`` (default 6, max 6). They all depend on ``surface-split``
+    (siblings) and run one at a time via ``concurrency=1``. A hunter
+    hard-fail must not skip later hunters or judges (``fail_fast=False``;
+    no hunter-to-hunter ``depends_on``). Each picks ``goals/0N-*.md`` if
+    present and no-ops cleanly if missing. Known-issues / GitHub dedupe
+    is omitted.
     """
     from agentflow import Graph, shell
 
-    timeout = PROFILE_TIMEOUT_SECONDS[scan_profile()]
+    timeout = hard_timeout_seconds()
     cwd = repo_dir() if agentflow_target_mode() == "local" else None
     judge_a = judge_a_model()
     judge_b = judge_b_model()
@@ -900,7 +967,7 @@ def build_goal_scan_graph(slug: str, *, description: str):
         description=description,
         working_dir=".",
         concurrency=1,
-        fail_fast=True,
+        fail_fast=False,
     ) as graph:
         prepare = shell(
             task_id="prepare",
@@ -983,8 +1050,11 @@ def build_goal_scan_graph(slug: str, *, description: str):
             ],
         )
         prepare >> threat >> author >> split
-        chain_goal_hunters(split, hunters)
-        hunters >> relevance >> exploit >> assemble >> publish
+        attach_goal_hunters(split, hunters)
+        # judge-a must not depends_on hunters: a failed hunter would skip
+        # judges via upstream_failure even with fail_fast=False. Hunters are
+        # declared first so concurrency=1 runs them before judge-a.
+        split >> relevance >> exploit >> assemble >> publish
     return graph
 
 

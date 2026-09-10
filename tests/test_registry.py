@@ -97,3 +97,10 @@ def test_readme_documents_openrouter_lock_and_default_targets() -> None:
     assert "serialized" in readme.lower() or "depends_on" in readme
     assert "90s" in readme
     assert "hunter-2..N never regain" in readme or "never regain a `surface-split` edge" in readme
+    assert "cmtuvv61w0003gm0az74grqv2" in readme
+    assert "AGENT_TIMEOUT_SECONDS" in readme
+    assert "1620" in readme
+    assert "27 minutes" in readme
+    assert "fail_fast" in readme
+    assert "7200" in readme
+    assert "3600" in readme
