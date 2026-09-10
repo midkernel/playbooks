@@ -286,6 +286,30 @@ def test_goal_security_review_graph_nodes_and_openrouter_lock() -> None:
     assert "stub report" in publish["prompt"]
 
 
+def test_low_profile_kimi_nodes_get_1800s() -> None:
+    """QA cmtutkn8k0003id04hs5s8j7z: per-node timeout was 900s (exit 124)."""
+    spec = _load(GOAL_SLUG, {"SCAN_PROFILE": "low", "PROFILE": "low"})
+    nodes = {node["id"]: node for node in spec["nodes"]}
+    for task_id in (
+        "threat-model",
+        "goal-author",
+        "surface-split",
+        "hunter-1",
+        "hunter-2",
+        "hunter-3",
+        "hunter-4",
+        "hunter-5",
+        "hunter-6",
+        "judge-a",
+        "judge-b",
+        "assemble",
+    ):
+        assert nodes[task_id]["timeout_seconds"] == 1800
+    assert nodes["prepare"]["timeout_seconds"] == 10 * 60
+    assert nodes["publish"]["timeout_seconds"] == 5 * 60
+    _assert_goal_hunters_serialized(nodes, 6)
+
+
 def test_goal_security_review_hunters_follow_goal_count() -> None:
     spec = _load(GOAL_SLUG, env={"GOAL_COUNT": "2"})
     nodes = {node["id"]: node for node in spec["nodes"]}
