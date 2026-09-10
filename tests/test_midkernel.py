@@ -225,13 +225,75 @@ def test_prepare_script_bakes_playbook_defaults() -> None:
     assert 'GITHUB_REF="${GITHUB_REF:-main}"' in firedancer
 
 
-def test_profile_timeout_seconds_low_is_30_minutes() -> None:
-    # Per-node kimi budget. QA cmtutkn8k0003id04hs5s8j7z: hunter-1 exit 124
-    # after 900s. Whole-run timeout is the runner's job; this table is per node.
+def test_profile_timeout_seconds_hard_table() -> None:
+    # Per-node kimi budget. James lock 2026-09-10 / QA cmtuvv61w0003gm0az74grqv2:
+    # low stays 30m; balanced 1h; max (exhaustive) 2h. Whole-run scaling is
+    # the runner's job; this table is per node.
     assert mk.PROFILE_TIMEOUT_SECONDS["low"] == 30 * 60 == 1800
-    assert mk.PROFILE_TIMEOUT_SECONDS["balanced"] == 30 * 60
-    assert mk.PROFILE_TIMEOUT_SECONDS["max"] == 60 * 60
+    assert mk.PROFILE_TIMEOUT_SECONDS["balanced"] == 60 * 60 == 3600
+    assert mk.PROFILE_TIMEOUT_SECONDS["max"] == 2 * 60 * 60 == 7200
     assert 900 not in mk.PROFILE_TIMEOUT_SECONDS.values()
+    assert mk.SOFT_DEADLINE_RATIO == 0.9
+    assert mk.TIMEOUT_ENV_NAMES == (
+        "AGENT_TIMEOUT_SECONDS",
+        "PROFILE_TIMEOUT_SECONDS",
+        "NODE_TIMEOUT_SECONDS",
+    )
+
+
+def test_hard_timeout_honors_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in mk.TIMEOUT_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("PROFILE", "low")
+    assert mk.hard_timeout_seconds() == 1800
+    assert mk.soft_deadline_seconds() == 1620
+    monkeypatch.setenv("AGENT_TIMEOUT_SECONDS", "2000")
+    assert mk.hard_timeout_seconds() == 2000
+    assert mk.soft_deadline_seconds() == 1800
+    monkeypatch.delenv("AGENT_TIMEOUT_SECONDS")
+    monkeypatch.setenv("PROFILE_TIMEOUT_SECONDS", "1000")
+    assert mk.hard_timeout_seconds() == 1000
+    assert mk.soft_deadline_seconds() == 900
+    monkeypatch.setenv("AGENT_TIMEOUT_SECONDS", "4000")
+    assert mk.hard_timeout_seconds() == 4000
+    assert mk.soft_deadline_seconds() == 3600
+    monkeypatch.setenv("AGENT_TIMEOUT_SECONDS", "nope")
+    monkeypatch.delenv("PROFILE_TIMEOUT_SECONDS")
+    assert mk.hard_timeout_seconds() == 1800
+    monkeypatch.setenv("PROFILE", "balanced")
+    monkeypatch.delenv("AGENT_TIMEOUT_SECONDS")
+    assert mk.hard_timeout_seconds() == 3600
+    assert mk.soft_deadline_seconds() == 3240
+    monkeypatch.setenv("PROFILE", "max")
+    assert mk.hard_timeout_seconds() == 7200
+    assert mk.soft_deadline_seconds() == 6480
+
+
+def test_soft_deadline_prompt_includes_27_minutes_for_low(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in mk.TIMEOUT_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("PROFILE", "low")
+    text = mk.wall_clock_budget_prompt()
+    assert "27 minutes" in text
+    assert "1620s" in text
+    assert "30 minutes" in text
+    assert "1800s" in text
+    assert "soft deadline" in text.lower()
+    hunter = mk.hunter_prompt("goal-security-review", 1)
+    assert "27 minutes" in hunter
+    assert "1620s" in hunter
+    assert "Write RESULT.md before the soft deadline" in hunter
+    review = mk.review_prompt("security-review")
+    assert "27 minutes" in review
+    assert "1620s" in review
+    balanced = mk.wall_clock_budget_prompt(hard=3600)
+    assert "54 minutes" in balanced
+    assert "3240s" in balanced
+    exhaustive = mk.wall_clock_budget_prompt(hard=7200)
+    assert "108 minutes" in exhaustive
+    assert "6480s" in exhaustive
 
 
 def test_goal_count_defaults_and_clamps(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -305,6 +367,7 @@ def test_build_scan_graph_unchanged_shape(monkeypatch: pytest.MonkeyPatch) -> No
     assert "python3" in nodes["prepare"]["prompt"]
     assert "refusing to upload a stub" in nodes["publish"]["prompt"]
     assert "stub report" in nodes["publish"]["prompt"]
+    assert graph.to_payload()["fail_fast"] is True
 
 
 def test_low_profile_goal_kimi_nodes_use_30_minute_timeout(
@@ -329,11 +392,20 @@ def test_low_profile_goal_kimi_nodes_use_30_minute_timeout(
         "assemble",
     ):
         assert nodes[task_id]["timeout_seconds"] == 1800
+        assert "27 minutes" in nodes[task_id]["prompt"]
+        assert "1620s" in nodes[task_id]["prompt"]
     assert nodes["prepare"]["timeout_seconds"] == 10 * 60
     assert nodes["publish"]["timeout_seconds"] == 5 * 60
     assert nodes["hunter-1"]["depends_on"] == ["surface-split"]
-    assert nodes["hunter-2"]["depends_on"] == ["hunter-1"]
+    assert nodes["hunter-2"]["depends_on"] == ["surface-split"]
+    assert "hunter-1" not in nodes["hunter-2"]["depends_on"]
+    assert set(nodes["judge-a"]["depends_on"]) == {"hunter-1", "hunter-2"}
+    assert "hunter-join" not in nodes
+    assert graph.to_payload()["fail_fast"] is False
     assert nodes["hunter-1"]["env"]["KIMI_MAX_TOKENS"] == "16384"
+    assert nodes["hunter-1"]["env"]["MIDKERNEL_HUNTER_CONTINUE"] == "1"
+    assert nodes["hunter-1"]["env"]["MIDKERNEL_NODE_TIMEOUT_SECONDS"] == "1800"
+    assert int(nodes["hunter-1"]["env"]["MIDKERNEL_NODE_TIMEOUT_SECONDS"]) == nodes["hunter-1"]["timeout_seconds"]
 
 
 def test_goal_graph_hunters_follow_goal_count(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -349,16 +421,93 @@ def test_goal_graph_hunters_follow_goal_count(monkeypatch: pytest.MonkeyPatch) -
     assert nodes["hunter-1"]["env"]["MIDKERNEL_NODE_DYNAMIC"] == "1"
     assert nodes["hunter-1"]["env"]["MIDKERNEL_NODE_PARENT"] == "surface-split"
     assert nodes["hunter-1"]["depends_on"] == ["surface-split"]
-    assert nodes["hunter-2"]["depends_on"] == ["hunter-1"]
-    assert nodes["hunter-3"]["depends_on"] == ["hunter-2"]
+    assert nodes["hunter-2"]["depends_on"] == ["surface-split"]
+    assert nodes["hunter-3"]["depends_on"] == ["surface-split"]
     ready_after_split = [
         hid
         for hid in ("hunter-1", "hunter-2", "hunter-3")
         if set(nodes[hid]["depends_on"]) <= {"surface-split"}
     ]
-    assert ready_after_split == ["hunter-1"]
+    assert ready_after_split == ["hunter-1", "hunter-2", "hunter-3"]
     assert set(nodes["judge-a"]["depends_on"]) == {"hunter-1", "hunter-2", "hunter-3"}
-    assert graph.to_payload()["concurrency"] == 1
+    assert "hunter-join" not in nodes
+    payload = graph.to_payload()
+    assert payload["concurrency"] == 1
+    assert payload["fail_fast"] is False
+
+
+def test_goal_graph_hunter_failure_does_not_fail_fast_siblings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hunter hard-fail must not skip later hunters or judges.
+
+    Agentflow fail_fast=True skips every remaining node (QA
+    cmtuvv61w0003gm0az74grqv2). A hunter-1 → hunter-2 depends_on chain
+    also skips hunter-2 via upstream_failure even when fail_fast is False.
+    """
+    pytest.importorskip("agentflow")
+    monkeypatch.setenv("GOAL_COUNT", "3")
+    graph = mk.build_goal_scan_graph(
+        "goal-security-review",
+        description="hunter continue-on-fail",
+    )
+    payload = graph.to_payload()
+    nodes = {node["id"]: node for node in payload["nodes"]}
+    assert payload["fail_fast"] is False
+    assert payload["concurrency"] == 1
+    for index in (1, 2, 3):
+        assert nodes[f"hunter-{index}"]["depends_on"] == ["surface-split"]
+        assert "hunter-1" not in nodes[f"hunter-{index}"]["depends_on"] or index == 1
+    assert "hunter-1" not in nodes["hunter-2"]["depends_on"]
+    assert "hunter-2" not in nodes["hunter-3"]["depends_on"]
+    assert set(nodes["judge-a"]["depends_on"]) == {"hunter-1", "hunter-2", "hunter-3"}
+    assert "hunter-join" not in nodes
+    assert nodes["judge-b"]["depends_on"] == ["judge-a"]
+    assert nodes["assemble"]["depends_on"] == ["judge-b"]
+    assert nodes["publish"]["depends_on"] == ["assemble"]
+
+
+def test_balanced_and_max_goal_kimi_timeouts(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("agentflow")
+    monkeypatch.setenv("GOAL_COUNT", "1")
+    monkeypatch.setenv("PROFILE", "balanced")
+    balanced = mk.build_goal_scan_graph(
+        "goal-security-review",
+        description="balanced timeout",
+    )
+    nodes = {node["id"]: node for node in balanced.to_payload()["nodes"]}
+    assert nodes["hunter-1"]["timeout_seconds"] == 3600
+    assert "54 minutes" in nodes["hunter-1"]["prompt"]
+    assert "3240s" in nodes["hunter-1"]["prompt"]
+    monkeypatch.setenv("PROFILE", "max")
+    exhaustive = mk.build_goal_scan_graph(
+        "goal-security-review",
+        description="max timeout",
+    )
+    nodes = {node["id"]: node for node in exhaustive.to_payload()["nodes"]}
+    assert nodes["hunter-1"]["timeout_seconds"] == 7200
+    assert "108 minutes" in nodes["hunter-1"]["prompt"]
+    assert "6480s" in nodes["hunter-1"]["prompt"]
+
+
+def test_agent_timeout_env_overrides_node_timeout_and_soft_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("agentflow")
+    monkeypatch.setenv("PROFILE", "low")
+    monkeypatch.setenv("GOAL_COUNT", "1")
+    monkeypatch.setenv("AGENT_TIMEOUT_SECONDS", "1000")
+    graph = mk.build_goal_scan_graph(
+        "goal-security-review",
+        description="env timeout override",
+    )
+    nodes = {node["id"]: node for node in graph.to_payload()["nodes"]}
+    assert nodes["hunter-1"]["timeout_seconds"] == 1000
+    assert "900s" in nodes["hunter-1"]["prompt"]
+    scan = mk.build_scan_graph("security-review", description="env timeout override")
+    review = next(node for node in scan.to_payload()["nodes"] if node["id"] == "review")
+    assert review["timeout_seconds"] == 1000
+    assert "900s" in review["prompt"]
 
 
 def test_review_prompt_names_default_targets() -> None:
@@ -376,6 +525,63 @@ def test_review_prompt_names_default_targets() -> None:
     assert "`main`" in firedancer
     assert "sanitizer" in firedancer.lower()
     assert "agave/" in firedancer
+
+
+def test_goal_ready_set_holds_judge_until_every_hunter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mechanical gate: judge-a is not ready until every hunter COMPLETED.
+
+    Replicates pinned agentflow 09df0175 ready/skip rules. Must not rely on
+    declaration order or concurrency=1 FIFO of a hash set.
+    """
+    pytest.importorskip("agentflow")
+    monkeypatch.setenv("GOAL_COUNT", "3")
+    payload = mk.build_goal_scan_graph(
+        "goal-security-review",
+        description="ready-set gate",
+    ).to_payload()
+    prefix = {"prepare", "threat-model", "goal-author", "surface-split"}
+    hunters = {"hunter-1", "hunter-2", "hunter-3"}
+
+    after_split = mk.agentflow_ready_node_ids(payload, completed=prefix)
+    assert after_split == hunters
+    assert "judge-a" not in after_split
+
+    one_pending = mk.agentflow_ready_node_ids(
+        payload,
+        completed=prefix | {"hunter-1"},
+    )
+    assert one_pending == {"hunter-2", "hunter-3"}
+    assert "judge-a" not in one_pending
+
+    all_completed = mk.agentflow_ready_node_ids(
+        payload,
+        completed=prefix | hunters,
+    )
+    assert "judge-a" in all_completed
+
+    # A FAILED hunter would skip judge-a — wrap must not leave hunters FAILED.
+    one_failed = mk.agentflow_ready_node_ids(
+        payload,
+        completed=prefix | {"hunter-2", "hunter-3"},
+        failed={"hunter-1"},
+    )
+    assert "judge-a" not in one_failed
+    assert mk.agentflow_run_failed({"hunter-1": "FAILED", "publish": "COMPLETED"})
+
+    split_failed = mk.agentflow_ready_node_ids(payload, failed={"surface-split"})
+    assert "hunter-1" not in split_failed
+    assert "judge-a" not in split_failed
+
+
+def test_hunter_timeout_does_not_mark_graph_node_failed() -> None:
+    """Product settle: hunter timeout is COMPLETED, so the GOAL run can succeed."""
+    assert mk.hunter_wrap_is_graph_completed(exit_code=0, result_exists=True) is True
+    assert mk.hunter_wrap_is_graph_completed(exit_code=124, result_exists=True) is False
+    assert mk.hunter_wrap_is_graph_completed(exit_code=0, result_exists=False) is False
+    assert mk.agentflow_run_failed({"hunter-1": "COMPLETED", "judge-a": "COMPLETED"}) is False
+    assert mk.agentflow_run_failed({"hunter-1": "FAILED", "judge-a": "COMPLETED"}) is True
 
 
 def test_emit_is_side_effect_free_without_run(

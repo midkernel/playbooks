@@ -40,28 +40,31 @@ GOAL_NODES = (
 pytest.importorskip("agentflow")
 
 
-def _assert_goal_hunters_serialized(nodes: dict, count: int) -> None:
-    """hunter-1 depends on surface-split; hunter-k depends on hunter-(k-1).
+def _assert_goal_hunters_continue_on_fail(
+    nodes: dict, count: int, spec: dict | None = None
+) -> None:
+    """Hunters are siblings of surface-split; judge-a depends_on every hunter.
 
-    After surface-split completes, only hunter-1 is ready. That is the
-    OpenRouter 429 fix (run cmtun51000003l704q7lyyjrf): do not fan out.
+    Agentflow skips dependents of FAILED nodes (upstream_failure) even when
+    fail_fast is False. A hunter-1 → hunter-2 chain would abort hunter-2..N
+    (QA cmtuvv61w0003gm0az74grqv2). Serialization is concurrency=1. Hunters
+    wrap to graph COMPLETED so judge-a can hard-depends_on them and a
+    hunter timeout does not fail the GOAL run.
     """
-    assert nodes["hunter-1"]["depends_on"] == ["surface-split"]
-    for index in range(2, count + 1):
-        assert nodes[f"hunter-{index}"]["depends_on"] == [f"hunter-{index - 1}"]
-    ready_after_split = [
-        f"hunter-{index}"
-        for index in range(1, count + 1)
-        if set(nodes[f"hunter-{index}"]["depends_on"]) <= {"surface-split"}
-    ]
-    assert ready_after_split == ["hunter-1"]
+    hunter_ids = [f"hunter-{index}" for index in range(1, count + 1)]
+    for hid in hunter_ids:
+        assert nodes[hid]["depends_on"] == ["surface-split"]
+        assert nodes[hid]["env"]["MIDKERNEL_HUNTER_CONTINUE"] == "1"
+        assert "on_failure_restart" not in nodes[hid]
     for left in range(1, count + 1):
         for right in range(left + 1, count + 1):
-            assert f"hunter-{left}" not in set(nodes[f"hunter-{right}"]["depends_on"]) or right == left + 1
-            assert not (
-                set(nodes[f"hunter-{left}"]["depends_on"]) <= {"surface-split"}
-                and set(nodes[f"hunter-{right}"]["depends_on"]) <= {"surface-split"}
-            )
+            assert f"hunter-{left}" not in set(nodes[f"hunter-{right}"]["depends_on"])
+    assert set(nodes["judge-a"]["depends_on"]) == set(hunter_ids)
+    assert "surface-split" not in nodes["judge-a"]["depends_on"]
+    assert "hunter-join" not in nodes
+    if spec is not None:
+        assert spec["fail_fast"] is False
+        assert spec["concurrency"] == 1
 
 
 def _load(slug: str, env: dict[str, str] | None = None) -> dict:
@@ -79,6 +82,11 @@ def _load(slug: str, env: dict[str, str] | None = None) -> dict:
         "MODEL",
         "JUDGE_A_MODEL",
         "JUDGE_B_MODEL",
+        "PROFILE",
+        "SCAN_PROFILE",
+        "AGENT_TIMEOUT_SECONDS",
+        "PROFILE_TIMEOUT_SECONDS",
+        "NODE_TIMEOUT_SECONDS",
     ):
         if not env or name not in env:
             merged.pop(name, None)
@@ -202,10 +210,11 @@ def test_goal_security_review_graph_nodes_and_openrouter_lock() -> None:
     assert set(nodes) == set(GOAL_NODES)
 
     assert spec["concurrency"] == 1
+    assert spec["fail_fast"] is False
     assert nodes["threat-model"]["depends_on"] == ["prepare"]
     assert nodes["goal-author"]["depends_on"] == ["threat-model"]
     assert nodes["surface-split"]["depends_on"] == ["goal-author"]
-    _assert_goal_hunters_serialized(nodes, 6)
+    _assert_goal_hunters_continue_on_fail(nodes, 6, spec)
     for index in range(1, 7):
         hunter = nodes[f"hunter-{index}"]
         assert hunter["agent"] == "kimi"
@@ -218,10 +227,13 @@ def test_goal_security_review_graph_nodes_and_openrouter_lock() -> None:
             for c in hunter.get("success_criteria", [])
         )
 
-    assert set(nodes["judge-a"]["depends_on"]) == {f"hunter-{i}" for i in range(1, 7)}
+    assert set(nodes["judge-a"]["depends_on"]) == {
+        f"hunter-{index}" for index in range(1, 7)
+    }
     assert nodes["judge-b"]["depends_on"] == ["judge-a"]
     assert nodes["assemble"]["depends_on"] == ["judge-b"]
     assert nodes["publish"]["depends_on"] == ["assemble"]
+    assert "hunter-join" not in nodes
 
     for task_id in (
         "threat-model",
@@ -301,25 +313,56 @@ def test_goal_security_review_hunters_follow_goal_count() -> None:
         "assemble",
         "publish",
     }
-    _assert_goal_hunters_serialized(nodes, 2)
+    _assert_goal_hunters_continue_on_fail(nodes, 2, spec)
     assert spec["concurrency"] == 1
+    assert spec["fail_fast"] is False
     assert set(nodes["judge-a"]["depends_on"]) == {"hunter-1", "hunter-2"}
 
 
-def test_goal_security_review_hunters_are_serialized_not_fanned_out() -> None:
-    """Parallel hunter-1..6 is the OpenRouter 429 RPM root cause."""
+def test_goal_security_review_ready_set_blocks_judge_until_hunters() -> None:
+    from pipelines import _midkernel as mk
+
+    spec = _load(GOAL_SLUG, env={"GOAL_COUNT": "3"})
+    prefix = {"prepare", "threat-model", "goal-author", "surface-split"}
+    hunters = {"hunter-1", "hunter-2", "hunter-3"}
+    after_split = mk.agentflow_ready_node_ids(spec, completed=prefix)
+    assert after_split == hunters
+    assert "judge-a" not in after_split
+    one_done = mk.agentflow_ready_node_ids(
+        spec, completed=prefix | {"hunter-1"}
+    )
+    assert one_done == {"hunter-2", "hunter-3"}
+    assert "judge-a" not in one_done
+    all_done = mk.agentflow_ready_node_ids(spec, completed=prefix | hunters)
+    assert "judge-a" in all_done
+    assert mk.hunter_wrap_is_graph_completed(exit_code=0, result_exists=True)
+    assert not mk.hunter_wrap_is_graph_completed(exit_code=124, result_exists=True)
+    assert not mk.agentflow_run_failed({"hunter-1": "COMPLETED", "publish": "COMPLETED"})
+    assert mk.agentflow_run_failed({"hunter-1": "FAILED", "publish": "COMPLETED"})
+
+
+def test_goal_security_review_hunter_failure_does_not_fail_fast() -> None:
+    """Hunter hard-fail must not skip siblings or judges (QA cmtuvv61w0003gm0az74grqv2)."""
     spec = _load(GOAL_SLUG)
     nodes = {node["id"]: node for node in spec["nodes"]}
     assert spec["concurrency"] == 1
-    _assert_goal_hunters_serialized(nodes, 6)
+    assert spec["fail_fast"] is False
+    _assert_goal_hunters_continue_on_fail(nodes, 6, spec)
     for index in range(1, 7):
-        deps = nodes[f"hunter-{index}"]["depends_on"]
-        assert len(deps) == 1
-        if index == 1:
-            assert deps == ["surface-split"]
-        else:
-            assert deps == [f"hunter-{index - 1}"]
-            assert "surface-split" not in deps
+        assert nodes[f"hunter-{index}"]["depends_on"] == ["surface-split"]
+        assert "soft deadline" in nodes[f"hunter-{index}"]["prompt"].lower()
+        assert "54 minutes" in nodes[f"hunter-{index}"]["prompt"]
+        assert "3240s" in nodes[f"hunter-{index}"]["prompt"]
+    assert set(nodes["judge-a"]["depends_on"]) == {
+        f"hunter-{index}" for index in range(1, 7)
+    }
+    assert "hunter-1" in nodes["judge-a"]["depends_on"]
+    low = _load(GOAL_SLUG, env={"PROFILE": "low", "GOAL_COUNT": "1"})
+    hunter = next(node for node in low["nodes"] if node["id"] == "hunter-1")
+    assert hunter["timeout_seconds"] == 1800
+    assert "27 minutes" in hunter["prompt"]
+    assert "1620s" in hunter["prompt"]
+    assert low["fail_fast"] is False
 
 
 def test_goal_security_review_local_in_task_override() -> None:
