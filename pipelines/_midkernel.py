@@ -78,10 +78,10 @@ MAX_GOAL_HUNTERS = 6
 DEFAULT_JUDGE_B_MODEL = "anthropic/claude-sonnet-4.5"
 DEFAULT_JUDGE_B_FALLBACK = "openai/gpt-4o"
 GOAL_HUNTER_IDS = tuple(f"hunter-{n}" for n in range(1, MAX_GOAL_HUNTERS + 1))
-HUNTER_JOIN_ID = "hunter-join"
 # Pinned agentflow 09df0175: ordinary nodes ready iff every dep is COMPLETED.
 # Cycle nodes (on_failure_restart set) ready iff every dep is COMPLETED or FAILED.
 # SKIPPED / CANCELLED parents still block a cycle join.
+# Any node FAILED → RunStatus.FAILED → CLI exit 1 (product settle).
 _ORDINARY_READY = frozenset({"COMPLETED"})
 _CYCLE_READY = frozenset({"COMPLETED", "FAILED"})
 _SKIP_PARENT = frozenset({"FAILED", "SKIPPED", "CANCELLED"})
@@ -946,8 +946,10 @@ def attach_goal_hunters(split, hunters) -> None:
 
     Declaration order / FIFO does **not** keep ``judge-a`` behind hunters.
     After ``surface-split``, the pinned orchestrator builds ``remaining`` as a
-    set and ``concurrency=1`` only serializes that arbitrary ready set. Judges
-    wait on :func:`attach_hunter_join`, not on hope.
+    set and ``concurrency=1`` only serializes that arbitrary ready set. The
+    gate is ``judge-a depends_on`` every hunter. Hunters must always
+    COMPLETE from agentflow's view (exit-0 wrap) so that edge is safe and
+    a hunter timeout does not fail the whole run.
     """
     for hunter in hunters:
         split >> hunter
@@ -958,41 +960,27 @@ def chain_goal_hunters(split, hunters) -> None:
     attach_goal_hunters(split, hunters)
 
 
-def hunter_join_script() -> str:
-    """Always-success barrier body. Graph status is COMPLETED even if hunters FAILED."""
-    return f"""
-set -euo pipefail
-WORKDIR="${{WORKDIR:-/workspace}}"
-printf '%s\\n' 'ok' > "{HUNTER_JOIN_ID}.ok"
-printf '%s\\n' 'ok' > "${{WORKDIR}}/{HUNTER_JOIN_ID}.ok"
-echo "{HUNTER_JOIN_ID}: barrier passed (every hunter is COMPLETED or FAILED)"
-""".strip()
+def attach_goal_judges(hunters, relevance) -> None:
+    """``judge-a`` waits on every hunter via real ``depends_on`` edges.
 
-
-def attach_hunter_join(hunters):
-    """Cycle join that becomes ready only after every hunter is terminal.
-
-    Pinned agentflow skips ordinary dependents of a FAILED parent
-    (``upstream_failure``) even with ``fail_fast=False``, so ``judge-a``
-    cannot ``depends_on`` hunters that may timeout. ``join.on_failure >> join``
-    marks this node as a cycle: the orchestrator waits until every hunter is
-    COMPLETED **or** FAILED, then runs this script (always exit 0).
-    ``judge-a`` depends only on this barrier.
+    Safe only because GOAL hunters wrap to graph COMPLETED (exit 0 +
+    nonempty RESULT.md) even on kimi timeout / non-zero. A FAILED hunter
+    would skip the judge (``upstream_failure``) and fail the agentflow run
+    (any FAILED node → ``RunStatus.FAILED`` → CLI exit 1 → refund).
     """
-    from agentflow import shell
-
-    join = shell(
-        task_id=HUNTER_JOIN_ID,
-        script=wrap_shell_script(HUNTER_JOIN_ID, hunter_join_script(), outputs=[f"{HUNTER_JOIN_ID}.ok"]),
-        env=shell_io_env(HUNTER_JOIN_ID),
-        timeout_seconds=2 * 60,
-        target=node_target(),
-        success_criteria=_file_criteria(f"{HUNTER_JOIN_ID}.ok"),
-    )
-    join.on_failure >> join
     if hunters:
-        hunters >> join
-    return join
+        hunters >> relevance
+    return relevance
+
+
+def agentflow_run_failed(statuses: dict[str, str]) -> bool:
+    """Pinned orchestrator: any FAILED node marks the whole run FAILED."""
+    return any(status == "FAILED" for status in statuses.values())
+
+
+def hunter_wrap_is_graph_completed(*, exit_code: int, result_exists: bool) -> bool:
+    """agentflow marks COMPLETED iff exit 0 **and** success_criteria pass."""
+    return exit_code == 0 and result_exists
 
 
 def agentflow_ready_node_ids(
@@ -1010,7 +998,7 @@ def agentflow_ready_node_ids(
     every parent is COMPLETED or FAILED, and are not skipped for a FAILED
     parent. SKIPPED / CANCELLED parents still block a cycle join.
 
-    ``judge-a`` must not appear here until ``hunter-join`` is COMPLETED.
+    ``judge-a`` must not appear here until every hunter is COMPLETED.
     """
     status: dict[str, str] = {}
     status.update({nid: "COMPLETED" for nid in completed})
@@ -1036,16 +1024,17 @@ def agentflow_ready_node_ids(
 
 
 def build_goal_scan_graph(slug: str, *, description: str):
-    """prepare → threat-model → goal-author → surface-split → hunters → hunter-join → judges → assemble → publish.
+    """prepare → threat-model → goal-author → surface-split → hunters → judges → assemble → publish.
 
     Hunters are first-class dynamic nodes ``hunter-1``…``hunter-N`` from
     ``GOAL_COUNT`` (default 6, max 6). They all depend on ``surface-split``
-    (siblings) and run one at a time via ``concurrency=1``. A hunter
-    hard-fail must not skip later hunters or judges (``fail_fast=False``;
-    no hunter-to-hunter ``depends_on``). ``judge-a`` depends on the
-    ``hunter-join`` cycle barrier, not on ``surface-split`` and not on
-    hunters directly. Each picks ``goals/0N-*.md`` if present and no-ops
-    cleanly if missing. Known-issues / GitHub dedupe is omitted.
+    (siblings) and run one at a time via ``concurrency=1``. Wrap exits 0
+    with RESULT.md so each hunter is COMPLETED even on kimi timeout /
+    non-zero (UI meta still records incomplete). ``judge-a`` then
+    ``depends_on`` every hunter. ``fail_fast=False`` so an unexpected
+    hunter FAIL still does not skip later hunter siblings. Each picks
+    ``goals/0N-*.md`` if present and no-ops cleanly if missing.
+    Known-issues / GitHub dedupe is omitted.
     """
     from agentflow import Graph, shell
 
@@ -1106,7 +1095,6 @@ def build_goal_scan_graph(slug: str, *, description: str):
             )
             for index in range(1, hunters_n + 1)
         ]
-        join = attach_hunter_join(hunters)
         relevance = _kimi_scan_node(
             task_id="judge-a",
             prompt=judge_a_prompt(slug),
@@ -1145,9 +1133,8 @@ def build_goal_scan_graph(slug: str, *, description: str):
         )
         prepare >> threat >> author >> split
         attach_goal_hunters(split, hunters)
-        # judge-a waits on the cycle barrier, not surface-split. concurrency=1
-        # FIFO of the ready set is hash-order, not declaration order.
-        join >> relevance >> exploit >> assemble >> publish
+        attach_goal_judges(hunters, relevance)
+        relevance >> exploit >> assemble >> publish
     return graph
 
 

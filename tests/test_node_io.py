@@ -829,6 +829,8 @@ def test_wrap_kimi_hunter_continue_soft_timeout_exits_zero(
     result = tmp_path / "repo" / "findings" / "hunter-1" / "RESULT.md"
     assert result.is_file()
     assert io.INCOMPLETE_HUNTER_MARKER in result.read_text(encoding="utf-8")
+    # exit 0 + nonempty RESULT.md is agentflow COMPLETED (not FAILED).
+    assert io.hunter_inner_timeout_seconds() < 2
 
 
 def test_wrap_kimi_uploads_result_when_model_writes_it(

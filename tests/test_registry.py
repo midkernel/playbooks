@@ -104,6 +104,7 @@ def test_readme_documents_openrouter_lock_and_default_targets() -> None:
     assert "fail_fast" in readme
     assert "7200" in readme
     assert "3600" in readme
-    assert "hunter-join" in readme
-    assert "on_failure" in readme
+    assert "MIDKERNEL_HUNTER_CONTINUE" in readme
+    assert "ecs_task_failed" in readme
     assert "09df0175" in readme
+    assert "exit 0" in readme

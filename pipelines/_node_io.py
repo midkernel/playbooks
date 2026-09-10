@@ -104,7 +104,6 @@ NODE_LABELS = {
     "threat-model": "Threat model",
     "goal-author": "Goal author",
     "surface-split": "Surface split",
-    "hunter-join": "Hunter join",
     "judge-a": "Judge A",
     "judge-b": "Judge B",
     "assemble": "Assemble",
@@ -1771,8 +1770,9 @@ def hunter_inner_timeout_seconds() -> int | None:
     """Kill kimi before the graph hard timeout so the wrapper can exit 0.
 
     Soft ratio matches playbook prompts (90% of ``MIDKERNEL_NODE_TIMEOUT_SECONDS``).
-    Agentflow SIGKILL at the hard timeout still marks the node FAILED; the
-    hunter-join cycle barrier covers that case.
+    The wrapper must finish (write RESULT.md, exit 0) before the graph hard
+    timeout, or agentflow SIGKILL marks the hunter FAILED and the whole
+    GOAL run becomes ``RunStatus.FAILED`` even if publish wrote report.md.
     """
     raw = env_first("MIDKERNEL_NODE_TIMEOUT_SECONDS")
     if not raw:
@@ -1828,6 +1828,19 @@ def ensure_incomplete_hunter_result(node_id: str, reason: str) -> None:
         path.write_text(body, encoding="utf-8")
 
 
+def complete_hunter_continue(node_id: str, error: str | None) -> int:
+    """Graph COMPLETED (exit 0 + RESULT.md). UI meta stays failed/incomplete."""
+    try:
+        ensure_incomplete_hunter_result(node_id, error or "hunter continue")
+    except OSError as exc:
+        print(f"node io: hunter continue RESULT.md failed: {exc}", file=sys.stderr)
+    try:
+        finish_node(node_id, status="failed", error=error, outputs=parse_outputs(None))
+    except Exception as exc:  # noqa: BLE001
+        print(f"node io: hunter continue finish failed: {exc}", file=sys.stderr)
+    return 0
+
+
 def wrap_kimi(argv: list[str]) -> int:
     if _is_kimi_probe(argv):
         return _forward_kimi_probe(argv)
@@ -1848,6 +1861,8 @@ def wrap_kimi(argv: list[str]) -> int:
     if is_report_md_wrapper(binary):
         error = f"refusing PATH kimi wrapper: {binary} (set MIDKERNEL_KIMI_BIN={IMAGE_KIMI_BIN})"
         print(f"node io: {error}", file=sys.stderr)
+        if hunter_continue_enabled(node_id):
+            return complete_hunter_continue(node_id, error)
         finish_node(node_id, status="failed", error=error)
         return 1
     model = env_first("MIDKERNEL_NODE_MODEL", "OPENROUTER_MODEL", "MODEL") or None
@@ -1874,6 +1889,8 @@ def wrap_kimi(argv: list[str]) -> int:
             proxy.stop()
         error = f"max_tokens proxy failed: {exc}"
         print(f"node io: {error}", file=sys.stderr)
+        if hunter_continue_enabled(node_id):
+            return complete_hunter_continue(node_id, error)
         finish_node(node_id, status="failed", error=error, outputs=parse_outputs(None))
         return 1
     print(
@@ -1903,15 +1920,14 @@ def wrap_kimi(argv: list[str]) -> int:
     if code != 0 and not error:
         error = f"exit {code}"
     # Upload files the model actually wrote (RESULT.md / report.md / …).
-    # Never invent hunter findings on 402 / 429 / empty return unless this is
-    # a GOAL hunter with MIDKERNEL_HUNTER_CONTINUE=1 (graph node must exit 0
-    # so judge-a is not skipped; RESULT.md is marked incomplete, not a finding).
+    # GOAL hunters (MIDKERNEL_HUNTER_CONTINUE=1) always exit 0 with a nonempty
+    # RESULT.md so agentflow marks the node COMPLETED. A FAILED hunter would
+    # skip judge-a and fail the whole run (CLI exit 1 / ecs_task_failed).
+    # Without the flag, wrap still does not invent findings on 402 / 429.
     if hunter_continue_enabled(node_id) and (
         code != 0 or not hunter_result_exists(node_id)
     ):
-        ensure_incomplete_hunter_result(node_id, error or "missing RESULT.md")
-        finish_node(node_id, status="failed", error=error, outputs=parse_outputs(None))
-        return 0
+        return complete_hunter_continue(node_id, error or "missing RESULT.md")
     finish_node(node_id, status=status, error=error, outputs=parse_outputs(None))
     return code
 

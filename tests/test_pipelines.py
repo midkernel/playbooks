@@ -31,7 +31,6 @@ GOAL_NODES = (
     "hunter-4",
     "hunter-5",
     "hunter-6",
-    "hunter-join",
     "judge-a",
     "judge-b",
     "assemble",
@@ -44,26 +43,25 @@ pytest.importorskip("agentflow")
 def _assert_goal_hunters_continue_on_fail(
     nodes: dict, count: int, spec: dict | None = None
 ) -> None:
-    """Hunters are siblings of surface-split; judge-a waits on hunter-join.
+    """Hunters are siblings of surface-split; judge-a depends_on every hunter.
 
     Agentflow skips dependents of FAILED nodes (upstream_failure) even when
     fail_fast is False. A hunter-1 → hunter-2 chain would abort hunter-2..N
-    (QA cmtuvv61w0003gm0az74grqv2). Serialization is concurrency=1. Judges
-    cannot hard-depends_on hunters; the cycle barrier is the gate.
+    (QA cmtuvv61w0003gm0az74grqv2). Serialization is concurrency=1. Hunters
+    wrap to graph COMPLETED so judge-a can hard-depends_on them and a
+    hunter timeout does not fail the GOAL run.
     """
     hunter_ids = [f"hunter-{index}" for index in range(1, count + 1)]
     for hid in hunter_ids:
         assert nodes[hid]["depends_on"] == ["surface-split"]
         assert nodes[hid]["env"]["MIDKERNEL_HUNTER_CONTINUE"] == "1"
+        assert "on_failure_restart" not in nodes[hid]
     for left in range(1, count + 1):
         for right in range(left + 1, count + 1):
             assert f"hunter-{left}" not in set(nodes[f"hunter-{right}"]["depends_on"])
-    assert set(nodes["hunter-join"]["depends_on"]) == set(hunter_ids)
-    assert nodes["hunter-join"]["on_failure_restart"] == ["hunter-join"]
-    assert nodes["judge-a"]["depends_on"] == ["hunter-join"]
+    assert set(nodes["judge-a"]["depends_on"]) == set(hunter_ids)
     assert "surface-split" not in nodes["judge-a"]["depends_on"]
-    for hid in hunter_ids:
-        assert hid not in nodes["judge-a"]["depends_on"]
+    assert "hunter-join" not in nodes
     if spec is not None:
         assert spec["fail_fast"] is False
         assert spec["concurrency"] == 1
@@ -229,13 +227,13 @@ def test_goal_security_review_graph_nodes_and_openrouter_lock() -> None:
             for c in hunter.get("success_criteria", [])
         )
 
-    assert nodes["judge-a"]["depends_on"] == ["hunter-join"]
+    assert set(nodes["judge-a"]["depends_on"]) == {
+        f"hunter-{index}" for index in range(1, 7)
+    }
     assert nodes["judge-b"]["depends_on"] == ["judge-a"]
     assert nodes["assemble"]["depends_on"] == ["judge-b"]
     assert nodes["publish"]["depends_on"] == ["assemble"]
-    assert nodes["hunter-join"]["agent"] == "shell"
-    assert nodes["hunter-join"]["on_failure_restart"] == ["hunter-join"]
-    assert nodes["hunter-join"]["timeout_seconds"] == 120
+    assert "hunter-join" not in nodes
 
     for task_id in (
         "threat-model",
@@ -310,7 +308,6 @@ def test_goal_security_review_hunters_follow_goal_count() -> None:
         "surface-split",
         "hunter-1",
         "hunter-2",
-        "hunter-join",
         "judge-a",
         "judge-b",
         "assemble",
@@ -319,10 +316,10 @@ def test_goal_security_review_hunters_follow_goal_count() -> None:
     _assert_goal_hunters_continue_on_fail(nodes, 2, spec)
     assert spec["concurrency"] == 1
     assert spec["fail_fast"] is False
-    assert nodes["judge-a"]["depends_on"] == ["hunter-join"]
+    assert set(nodes["judge-a"]["depends_on"]) == {"hunter-1", "hunter-2"}
 
 
-def test_goal_security_review_ready_set_blocks_judge_until_join() -> None:
+def test_goal_security_review_ready_set_blocks_judge_until_hunters() -> None:
     from pipelines import _midkernel as mk
 
     spec = _load(GOAL_SLUG, env={"GOAL_COUNT": "3"})
@@ -331,14 +328,17 @@ def test_goal_security_review_ready_set_blocks_judge_until_join() -> None:
     after_split = mk.agentflow_ready_node_ids(spec, completed=prefix)
     assert after_split == hunters
     assert "judge-a" not in after_split
-    assert "hunter-join" not in after_split
-    all_failed = mk.agentflow_ready_node_ids(spec, completed=prefix, failed=hunters)
-    assert all_failed == {"hunter-join"}
-    assert "judge-a" not in all_failed
-    join_done = mk.agentflow_ready_node_ids(
-        spec, completed=prefix | hunters | {"hunter-join"}
+    one_done = mk.agentflow_ready_node_ids(
+        spec, completed=prefix | {"hunter-1"}
     )
-    assert "judge-a" in join_done
+    assert one_done == {"hunter-2", "hunter-3"}
+    assert "judge-a" not in one_done
+    all_done = mk.agentflow_ready_node_ids(spec, completed=prefix | hunters)
+    assert "judge-a" in all_done
+    assert mk.hunter_wrap_is_graph_completed(exit_code=0, result_exists=True)
+    assert not mk.hunter_wrap_is_graph_completed(exit_code=124, result_exists=True)
+    assert not mk.agentflow_run_failed({"hunter-1": "COMPLETED", "publish": "COMPLETED"})
+    assert mk.agentflow_run_failed({"hunter-1": "FAILED", "publish": "COMPLETED"})
 
 
 def test_goal_security_review_hunter_failure_does_not_fail_fast() -> None:
@@ -353,8 +353,10 @@ def test_goal_security_review_hunter_failure_does_not_fail_fast() -> None:
         assert "soft deadline" in nodes[f"hunter-{index}"]["prompt"].lower()
         assert "54 minutes" in nodes[f"hunter-{index}"]["prompt"]
         assert "3240s" in nodes[f"hunter-{index}"]["prompt"]
-    assert nodes["judge-a"]["depends_on"] == ["hunter-join"]
-    assert "hunter-1" not in nodes["judge-a"]["depends_on"]
+    assert set(nodes["judge-a"]["depends_on"]) == {
+        f"hunter-{index}" for index in range(1, 7)
+    }
+    assert "hunter-1" in nodes["judge-a"]["depends_on"]
     low = _load(GOAL_SLUG, env={"PROFILE": "low", "GOAL_COUNT": "1"})
     hunter = next(node for node in low["nodes"] if node["id"] == "hunter-1")
     assert hunter["timeout_seconds"] == 1800
