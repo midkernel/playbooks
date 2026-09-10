@@ -192,3 +192,13 @@ def normalize_openrouter_model(raw: str, *, default: str = DEFAULT_OPENROUTER_MO
 def openrouter_model() -> str:
     raw = env_first("OPENROUTER_MODEL", "MODEL", default=DEFAULT_OPENROUTER_MODEL)
     return normalize_openrouter_model(raw, default=DEFAULT_OPENROUTER_MODEL)
+
+
+def goal_count() -> int:
+    """How many hunter-* nodes to emit (default 6, max 6). First-class dynamic nodes."""
+    raw = env_first("GOAL_COUNT", default=str(DEFAULT_GOAL_COUNT))
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_GOAL_COUNT
+    return max(1, min(value, MAX_GOAL_HUNTERS))
