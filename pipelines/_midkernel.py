@@ -75,6 +75,16 @@ DEFAULT_OPENROUTER_MODEL = "google/gemini-3.8-flash"
 DEFAULT_PLAYBOOKS_REPO = "https://github.com/midkernel/playbooks"
 DEFAULT_GOAL_COUNT = 6
 MAX_GOAL_HUNTERS = 6
+# Safe default slots for GOAL hunter siblings. 1 is the #12 429 guard that
+# made ReactFlow look serial. 6 is the 429 burst (cmtun51000003l704q7lyyjrf).
+# App Start-scan picker should offer these exact values.
+DEFAULT_GOAL_CONCURRENCY = 2
+GOAL_CONCURRENCY_PICKER = (1, 2, 4, 6)
+GOAL_CONCURRENCY_ENV_NAMES = (
+    "GOAL_CONCURRENCY",
+    "CONCURRENCY",
+    "GRAPH_CONCURRENCY",
+)
 DEFAULT_JUDGE_B_MODEL = "anthropic/claude-sonnet-4.5"
 DEFAULT_JUDGE_B_FALLBACK = "openai/gpt-4o"
 GOAL_HUNTER_IDS = tuple(f"hunter-{n}" for n in range(1, MAX_GOAL_HUNTERS + 1))
@@ -932,14 +942,39 @@ def assemble_prompt(slug: str) -> str:
     )
 
 
+def goal_concurrency_cap() -> int:
+    """App Start-scan picker / env override for GOAL hunter slots.
+
+    First-wins: ``GOAL_CONCURRENCY``, ``CONCURRENCY``, ``GRAPH_CONCURRENCY``.
+    Predefined picker: ``1 | 2 | 4 | 6``. Any int in ``1..MAX_GOAL_HUNTERS``
+    is accepted. Missing / invalid → ``DEFAULT_GOAL_CONCURRENCY`` (2).
+
+    This is a **client** cap. OpenRouter new-account 20 RPM
+    (``limit_source=openrouter_new_account``, run ``cmtun51000003l704q7lyyjrf``)
+    is an **account** limit Midkernel cannot raise from the playbook.
+    ``wrap_kimi`` retries 429 (Retry-After through 90s / 8 tries).
+    """
+    raw = env_first(*GOAL_CONCURRENCY_ENV_NAMES)
+    if raw:
+        try:
+            return max(1, min(MAX_GOAL_HUNTERS, int(raw)))
+        except ValueError:
+            pass
+    return DEFAULT_GOAL_CONCURRENCY
+
+
 def goal_hunter_concurrency(count: int | None = None) -> int:
-    """Graph-wide slots so every hunter sibling can run at once.
+    """Effective Graph concurrency: ``min(GOAL_COUNT, cap)``.
 
     Sequential prefix/suffix stay ordered by ``depends_on``. ``judge-a``
-    still waits on every hunter. ``count`` is ``GOAL_COUNT`` (1..6).
+    still waits on every hunter. Default cap is 2 so hunters are parallel
+    without the six-wide 429 burst. Raise via ``GOAL_CONCURRENCY``.
     """
-    n = goal_count() if count is None else int(count)
-    return max(1, min(n, MAX_GOAL_HUNTERS))
+    if count is None:
+        hunters = goal_count()
+    else:
+        hunters = max(1, min(int(count), MAX_GOAL_HUNTERS))
+    return min(hunters, goal_concurrency_cap())
 
 
 def attach_goal_hunters(split, hunters) -> None:
@@ -951,10 +986,12 @@ def attach_goal_hunters(split, hunters) -> None:
     times out (QA ``cmtuvv61w0003gm0az74grqv2``). Do **not** serialize
     hunters with a ``depends_on`` chain.
 
-    Parallel execution is ``Graph(concurrency=N)`` matching ``GOAL_COUNT``.
-    ``concurrency=1`` was the 429 workaround (run ``cmtun51000003l704q7lyyjrf``)
-    and is what made ReactFlow / the runner look serial. OpenRouter 429 is
-    mitigated by ``wrap_kimi`` Retry-After (up to 90s / 8 tries).
+    Parallel execution is ``Graph(concurrency=min(GOAL_COUNT, cap))``.
+    Default cap is **2** (not 1). ``concurrency=1`` was the #12 429
+    workaround (run ``cmtun51000003l704q7lyyjrf``) and is what made
+    ReactFlow look serial. Override from the app Start-scan picker via
+    ``GOAL_CONCURRENCY`` (``1|2|4|6``). Account-side OpenRouter 20 RPM
+    cannot be raised here; ``wrap_kimi`` retries 429 (90s / 8 tries).
 
     The gate is ``judge-a depends_on`` every hunter. Hunters must always
     COMPLETE from agentflow's view (exit-0 wrap) so that edge is safe and
@@ -1037,7 +1074,8 @@ def build_goal_scan_graph(slug: str, *, description: str):
 
     Hunters are first-class dynamic nodes ``hunter-1``…``hunter-N`` from
     ``GOAL_COUNT`` (default 6, max 6). They all depend on ``surface-split``
-    (siblings) and run in parallel via ``concurrency=N``. Wrap exits 0
+    (siblings) and run in parallel via ``concurrency=min(GOAL_COUNT, cap)``
+    (default cap **2**, env ``GOAL_CONCURRENCY``). Wrap exits 0
     with RESULT.md so each hunter is COMPLETED even on kimi timeout /
     non-zero (UI meta still records incomplete). ``judge-a`` then
     ``depends_on`` every hunter. ``fail_fast=False`` so an unexpected

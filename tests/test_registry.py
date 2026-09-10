@@ -97,7 +97,9 @@ def test_readme_documents_openrouter_lock_and_default_targets() -> None:
     assert "fan-out" in readme.lower() or "parallel" in readme.lower()
     assert "depends_on" in readme
     assert "90s" in readme
-    assert "concurrency=N" in readme
+    assert "GOAL_CONCURRENCY" in readme
+    assert "default **2**" in readme
+    assert "`1|2|4|6`" in readme
     assert "cmtuvv61w0003gm0az74grqv2" in readme
     assert "AGENT_TIMEOUT_SECONDS" in readme
     assert "1620" in readme

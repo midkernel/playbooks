@@ -20,7 +20,8 @@ finishes (idempotent), with a **fan-out**
 ``parentId`` stays ``surface-split`` for UI grouping. ``update_node`` /
 ``start_node`` must keep that fan-out (drop leftover ``hunter-k → hunter-(k+1)``
 serial edges from the old 429 workaround). Agentflow ``depends_on`` is the
-same sibling fan-out; ``concurrency=N`` runs the hunters in parallel.
+same sibling fan-out; ``concurrency=min(GOAL_COUNT, GOAL_CONCURRENCY)``
+(default **2**) runs a bounded hunter fan-out.
 
 This module is stdlib + optional ``boto3``. The helper is copied onto the
 shared task disk only when a run is actually executing so in-task nodes
@@ -359,8 +360,9 @@ class OpenRouterMaxTokensProxy:
     429 responses are retried (Retry-After through 90s, or exponential
     backoff; default 8 attempts) so an in-node kimi burst — or a parallel
     hunter fan-out — can wait out a 20 RPM (60s) window. GOAL hunters run
-    in parallel (``concurrency=N``); these retries are the 429 mitigation
-    (run ``cmtun51000003l704q7lyyjrf``). 402 is never retried.
+    in parallel (default ``concurrency=2``); these retries are the client-side
+    429 mitigation. The 20 RPM new-account cap is an OpenRouter **account**
+    limit (run ``cmtun51000003l704q7lyyjrf``). 402 is never retried.
     """
 
     def __init__(
