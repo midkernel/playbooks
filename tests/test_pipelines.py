@@ -47,9 +47,9 @@ def _assert_goal_hunters_continue_on_fail(
 
     Agentflow skips dependents of FAILED nodes (upstream_failure) even when
     fail_fast is False. A hunter-1 → hunter-2 chain would abort hunter-2..N
-    (QA cmtuvv61w0003gm0az74grqv2). Serialization is concurrency=1. Hunters
-    wrap to graph COMPLETED so judge-a can hard-depends_on them and a
-    hunter timeout does not fail the GOAL run.
+    (QA cmtuvv61w0003gm0az74grqv2). Default parallelism is concurrency=2
+    (GOAL_CONCURRENCY picker). Hunters wrap to graph COMPLETED so judge-a
+    can hard-depends_on them and a hunter timeout does not fail the GOAL run.
     """
     hunter_ids = [f"hunter-{index}" for index in range(1, count + 1)]
     for hid in hunter_ids:
@@ -64,7 +64,7 @@ def _assert_goal_hunters_continue_on_fail(
     assert "hunter-join" not in nodes
     if spec is not None:
         assert spec["fail_fast"] is False
-        assert spec["concurrency"] == 1
+        assert spec["concurrency"] == min(count, 2)
 
 
 def _load(slug: str, env: dict[str, str] | None = None) -> dict:
@@ -87,6 +87,10 @@ def _load(slug: str, env: dict[str, str] | None = None) -> dict:
         "AGENT_TIMEOUT_SECONDS",
         "PROFILE_TIMEOUT_SECONDS",
         "NODE_TIMEOUT_SECONDS",
+        "GOAL_CONCURRENCY",
+        "CONCURRENCY",
+        "GRAPH_CONCURRENCY",
+        "GOAL_COUNT",
     ):
         if not env or name not in env:
             merged.pop(name, None)
@@ -209,7 +213,7 @@ def test_goal_security_review_graph_nodes_and_openrouter_lock() -> None:
     assert tuple(nodes) == GOAL_NODES or set(nodes) == set(GOAL_NODES)
     assert set(nodes) == set(GOAL_NODES)
 
-    assert spec["concurrency"] == 1
+    assert spec["concurrency"] == 2
     assert spec["fail_fast"] is False
     assert nodes["threat-model"]["depends_on"] == ["prepare"]
     assert nodes["goal-author"]["depends_on"] == ["threat-model"]
@@ -314,7 +318,7 @@ def test_goal_security_review_hunters_follow_goal_count() -> None:
         "publish",
     }
     _assert_goal_hunters_continue_on_fail(nodes, 2, spec)
-    assert spec["concurrency"] == 1
+    assert spec["concurrency"] == 2
     assert spec["fail_fast"] is False
     assert set(nodes["judge-a"]["depends_on"]) == {"hunter-1", "hunter-2"}
 
@@ -345,7 +349,7 @@ def test_goal_security_review_hunter_failure_does_not_fail_fast() -> None:
     """Hunter hard-fail must not skip siblings or judges (QA cmtuvv61w0003gm0az74grqv2)."""
     spec = _load(GOAL_SLUG)
     nodes = {node["id"]: node for node in spec["nodes"]}
-    assert spec["concurrency"] == 1
+    assert spec["concurrency"] == 2
     assert spec["fail_fast"] is False
     _assert_goal_hunters_continue_on_fail(nodes, 6, spec)
     for index in range(1, 7):
@@ -363,6 +367,19 @@ def test_goal_security_review_hunter_failure_does_not_fail_fast() -> None:
     assert "27 minutes" in hunter["prompt"]
     assert "1620s" in hunter["prompt"]
     assert low["fail_fast"] is False
+    assert low["concurrency"] == 1
+
+
+def test_goal_security_review_concurrency_picker_override() -> None:
+    """App Start-scan picker contract: GOAL_CONCURRENCY first-wins."""
+    four = _load(GOAL_SLUG, env={"GOAL_CONCURRENCY": "4"})
+    assert four["concurrency"] == 4
+    six = _load(GOAL_SLUG, env={"GOAL_CONCURRENCY": "6"})
+    assert six["concurrency"] == 6
+    alias = _load(GOAL_SLUG, env={"CONCURRENCY": "4", "GOAL_COUNT": "3"})
+    assert alias["concurrency"] == 3
+    invalid = _load(GOAL_SLUG, env={"GOAL_CONCURRENCY": "nope"})
+    assert invalid["concurrency"] == 2
 
 
 def test_goal_security_review_local_in_task_override() -> None:

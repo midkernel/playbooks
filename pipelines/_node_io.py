@@ -15,12 +15,13 @@ S3 layout (bucket default ``midkernel-dev-artifacts``; prefix default ``runs/``)
 Progress is ``{completed, total, percent, etaSeconds}``. Dynamic hunters
 (``hunter-1``…``hunter-N`` from ``GOAL_COUNT``) are first-class: spawned into
 ``graph.json`` when the graph is initialized and again when ``surface-split``
-finishes (idempotent), with a serialized chain
-``surface-split → hunter-1 → hunter-2 → … → hunter-N`` and each hunter also
-edging to ``judge-a``. ``update_node`` / ``start_node`` must keep that chain:
-``parentId`` stays ``surface-split`` for UI grouping, but hunter-2..N never
-regain a ``surface-split`` edge. Parallel fan-out is the 429 root cause
-(run ``cmtun51000003l704q7lyyjrf``).
+finishes (idempotent), with a **fan-out**
+``surface-split → hunter-1…N`` and each hunter also edging to ``judge-a``.
+``parentId`` stays ``surface-split`` for UI grouping. ``update_node`` /
+``start_node`` must keep that fan-out (drop leftover ``hunter-k → hunter-(k+1)``
+serial edges from the old 429 workaround). Agentflow ``depends_on`` is the
+same sibling fan-out; ``concurrency=min(GOAL_COUNT, GOAL_CONCURRENCY)``
+(default **2**) runs a bounded hunter fan-out.
 
 This module is stdlib + optional ``boto3``. The helper is copied onto the
 shared task disk only when a run is actually executing so in-task nodes
@@ -85,8 +86,8 @@ MAX_TOKENS_ENV_NAMES = (
     "KIMI_MODEL_MAX_COMPLETION_TOKENS",
 )
 # Defense in depth for OpenRouter 429 RPM (new-account 20 req/min on
-# moonshotai/kimi-k3, run cmtun51000003l704q7lyyjrf). Serialization of GOAL
-# hunters is the primary fix; these retries cover a transient in-node burst.
+# moonshotai/kimi-k3, run cmtun51000003l704q7lyyjrf). GOAL hunters run in
+# parallel; these retries cover an in-node burst and the hunter fan-out.
 # A 20 RPM window is 60s — honor Retry-After through 90s and keep enough
 # attempts that exponential backoff can wait out that window. Never retry 402.
 DEFAULT_OPENROUTER_429_RETRIES = 8
@@ -357,9 +358,11 @@ class OpenRouterMaxTokensProxy:
     OpenRouter actually receives, so wrap_kimi must clamp that body.
 
     429 responses are retried (Retry-After through 90s, or exponential
-    backoff; default 8 attempts) so an in-node kimi burst can wait out a
-    20 RPM (60s) window. Serialization of GOAL hunters is the primary 429
-    fix; this is defense in depth. 402 is never retried.
+    backoff; default 8 attempts) so an in-node kimi burst — or a parallel
+    hunter fan-out — can wait out a 20 RPM (60s) window. GOAL hunters run
+    in parallel (default ``concurrency=2``); these retries are the client-side
+    429 mitigation. The 20 RPM new-account cap is an OpenRouter **account**
+    limit (run ``cmtun51000003l704q7lyyjrf``). 402 is never retried.
     """
 
     def __init__(
@@ -714,18 +717,24 @@ def hunter_index(node_id: str) -> int | None:
 
 
 def hunter_graph_predecessor(node_id: str, *, source: str = "surface-split") -> str | None:
-    """Serialized predecessor for hunter-N edges in ``graph.json``.
+    """Fan-out parent for hunter-N edges in ``graph.json``.
 
-    ``hunter-1`` depends on *source* (``surface-split``). ``hunter-k`` depends
-    on ``hunter-(k-1)``. Never ``surface-split → hunter-2..N`` — that fan-out
-    is the 429 (run ``cmtun51000003l704q7lyyjrf``). ``parentId`` stays
-    ``surface-split`` for UI grouping; it is not the execution edge.
+    Every hunter depends on *source* (``surface-split``). Serial
+    ``hunter-(k-1) → hunter-k`` edges are leftover from the 429 workaround
+    and must be dropped so ReactFlow matches agentflow ``depends_on``.
+    ``parentId`` stays ``surface-split`` for UI grouping.
     """
     index = hunter_index(node_id)
     if index is None:
         return None
-    if index <= 1:
-        return source
+    return source
+
+
+def leftover_serial_hunter_predecessor(node_id: str) -> str | None:
+    """``hunter-(k-1)`` if *node_id* is hunter-k for k>1; else None."""
+    index = hunter_index(node_id)
+    if index is None or index <= 1:
+        return None
     return f"hunter-{index - 1}"
 
 
@@ -899,7 +908,7 @@ def _upsert_edge(graph: dict[str, Any], source: str, target: str) -> None:
 
 
 def _drop_edge(graph: dict[str, Any], source: str, target: str) -> None:
-    """Remove a source→target edge if present (fan-out cleanup)."""
+    """Remove a source→target edge if present (serial-chain cleanup)."""
     source = safe_node_id(source)
     target = safe_node_id(target)
     edge_id = f"e-{source}-{target}"
@@ -920,11 +929,11 @@ def _upsert_dynamic_hunter_edges(
     parent_id: str | None = None,
     target: str = "judge-a",
 ) -> None:
-    """Keep hunter-2..N on the serialized chain, never parentId fan-out.
+    """Keep hunter-1..N on the surface-split fan-out, never a serial chain.
 
-    ``update_node`` used to ``_upsert_edge(parentId or surface-split, hunter-N)``
-    on every start/finish. ``parentId`` is always ``surface-split``, so that
-    reintroduced ``surface-split → hunter-2..N`` after ``spawn_hunters``.
+    ``parentId`` is always ``surface-split`` (UI grouping) and is also the
+    execution / ReactFlow edge. Drop leftover ``hunter-(k-1) → hunter-k``
+    so start/finish cannot re-serialize the live graph.
     """
     source = parent_id or "surface-split"
     predecessor = hunter_graph_predecessor(node_id, source=source)
@@ -934,8 +943,9 @@ def _upsert_dynamic_hunter_edges(
         return
     _upsert_edge(graph, predecessor, node_id)
     _upsert_edge(graph, node_id, target)
-    if predecessor != source:
-        _drop_edge(graph, source, node_id)
+    leftover = leftover_serial_hunter_predecessor(node_id)
+    if leftover:
+        _drop_edge(graph, leftover, node_id)
 
 
 def graph_node_record(
@@ -1022,11 +1032,11 @@ def spawn_hunters(
     target: str = "judge-a",
     model: str | None = None,
 ) -> dict[str, Any]:
-    """Add hunter-1..N as first-class dynamic nodes + serialized edges. Idempotent.
+    """Add hunter-1..N as first-class dynamic nodes + fan-out edges. Idempotent.
 
-    Edges are ``source → hunter-1 → hunter-2 → … → hunter-N`` plus each hunter
-    → *target* (judge-a). Do not fan out every hunter from ``surface-split`` —
-    that parallel burst is the 429 (run ``cmtun51000003l704q7lyyjrf``).
+    Edges are ``source → hunter-k`` plus each hunter → *target* (judge-a).
+    Drop leftover ``hunter-(k-1) → hunter-k`` serial edges so ReactFlow
+    matches the agentflow sibling fan-out.
     """
     if not node_io_enabled():
         return load_graph()
@@ -1034,7 +1044,6 @@ def spawn_hunters(
     lock = _with_graph_lock()
     try:
         graph = load_graph()
-        predecessor = source
         for index in range(1, n + 1):
             nid = f"hunter-{index}"
             existing = next((node for node in graph.get("nodes") or [] if node.get("id") == nid), None)
@@ -1051,11 +1060,11 @@ def spawn_hunters(
                     if existing.get(key):
                         record[key] = existing[key]
             _upsert_node(graph, record)
-            _upsert_edge(graph, predecessor, nid)
+            _upsert_edge(graph, source, nid)
             _upsert_edge(graph, nid, target)
-            if predecessor != source:
-                _drop_edge(graph, source, nid)
-            predecessor = nid
+            leftover = leftover_serial_hunter_predecessor(nid)
+            if leftover:
+                _drop_edge(graph, leftover, nid)
         return save_graph(graph)
     finally:
         lock.close()
@@ -1096,8 +1105,8 @@ def update_node(node_id: str, **fields: Any) -> dict[str, Any]:
         record["artifacts"] = node_artifact_keys(node_id)
         _upsert_node(graph, record)
         if record.get("dynamic") or is_dynamic_node(node_id):
-            # parentId stays surface-split for UI grouping. Do not upsert that
-            # as the execution edge — hunter-2..N would regain fan-out.
+            # parentId is surface-split for UI grouping *and* the fan-out
+            # edge. Drop leftover hunter-k → hunter-(k+1) serial edges.
             _upsert_dynamic_hunter_edges(
                 graph,
                 node_id,

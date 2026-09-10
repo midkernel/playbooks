@@ -330,6 +330,35 @@ def test_goal_playbook_prompt_and_no_default_target() -> None:
     assert mk.default_target("goal-security-review") is None
 
 
+def test_goal_hunter_concurrency_defaults_to_two(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in mk.GOAL_CONCURRENCY_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GOAL_COUNT", "6")
+    assert mk.DEFAULT_GOAL_CONCURRENCY == 2
+    assert mk.GOAL_CONCURRENCY_PICKER == (1, 2, 4, 6)
+    assert mk.goal_concurrency_cap() == 2
+    assert mk.goal_hunter_concurrency() == 2
+    assert mk.goal_hunter_concurrency(1) == 1
+    assert mk.goal_hunter_concurrency(3) == 2
+    assert mk.goal_hunter_concurrency(0) == 1
+    monkeypatch.setenv("GOAL_CONCURRENCY", "4")
+    assert mk.goal_concurrency_cap() == 4
+    assert mk.goal_hunter_concurrency() == 4
+    assert mk.goal_hunter_concurrency(2) == 2
+    monkeypatch.setenv("GOAL_CONCURRENCY", "6")
+    assert mk.goal_hunter_concurrency() == 6
+    monkeypatch.setenv("GOAL_CONCURRENCY", "99")
+    assert mk.goal_hunter_concurrency() == mk.MAX_GOAL_HUNTERS
+    monkeypatch.setenv("GOAL_CONCURRENCY", "nope")
+    assert mk.goal_concurrency_cap() == 2
+    monkeypatch.setenv("CONCURRENCY", "6")
+    monkeypatch.setenv("GOAL_CONCURRENCY", "2")
+    assert mk.goal_concurrency_cap() == 2
+    monkeypatch.delenv("GOAL_CONCURRENCY", raising=False)
+    monkeypatch.setenv("CONCURRENCY", "4")
+    assert mk.goal_concurrency_cap() == 4
+
+
 def test_goal_prompts_omit_github_dedupe() -> None:
     hunter = mk.hunter_prompt("goal-security-review", 3)
     assert "goals/03-" in hunter
@@ -374,6 +403,8 @@ def test_low_profile_goal_kimi_nodes_use_30_minute_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pytest.importorskip("agentflow")
+    for name in mk.GOAL_CONCURRENCY_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("PROFILE", "low")
     monkeypatch.setenv("GOAL_COUNT", "2")
     graph = mk.build_goal_scan_graph(
@@ -402,6 +433,7 @@ def test_low_profile_goal_kimi_nodes_use_30_minute_timeout(
     assert set(nodes["judge-a"]["depends_on"]) == {"hunter-1", "hunter-2"}
     assert "hunter-join" not in nodes
     assert graph.to_payload()["fail_fast"] is False
+    assert graph.to_payload()["concurrency"] == 2  # min(GOAL_COUNT=2, default cap 2)
     assert nodes["hunter-1"]["env"]["KIMI_MAX_TOKENS"] == "16384"
     assert nodes["hunter-1"]["env"]["MIDKERNEL_HUNTER_CONTINUE"] == "1"
     assert nodes["hunter-1"]["env"]["MIDKERNEL_NODE_TIMEOUT_SECONDS"] == "1800"
@@ -410,6 +442,8 @@ def test_low_profile_goal_kimi_nodes_use_30_minute_timeout(
 
 def test_goal_graph_hunters_follow_goal_count(monkeypatch: pytest.MonkeyPatch) -> None:
     pytest.importorskip("agentflow")
+    for name in mk.GOAL_CONCURRENCY_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("GOAL_COUNT", "3")
     graph = mk.build_goal_scan_graph(
         "goal-security-review",
@@ -432,7 +466,7 @@ def test_goal_graph_hunters_follow_goal_count(monkeypatch: pytest.MonkeyPatch) -
     assert set(nodes["judge-a"]["depends_on"]) == {"hunter-1", "hunter-2", "hunter-3"}
     assert "hunter-join" not in nodes
     payload = graph.to_payload()
-    assert payload["concurrency"] == 1
+    assert payload["concurrency"] == 2
     assert payload["fail_fast"] is False
 
 
@@ -446,6 +480,8 @@ def test_goal_graph_hunter_failure_does_not_fail_fast_siblings(
     also skips hunter-2 via upstream_failure even when fail_fast is False.
     """
     pytest.importorskip("agentflow")
+    for name in mk.GOAL_CONCURRENCY_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("GOAL_COUNT", "3")
     graph = mk.build_goal_scan_graph(
         "goal-security-review",
@@ -454,7 +490,7 @@ def test_goal_graph_hunter_failure_does_not_fail_fast_siblings(
     payload = graph.to_payload()
     nodes = {node["id"]: node for node in payload["nodes"]}
     assert payload["fail_fast"] is False
-    assert payload["concurrency"] == 1
+    assert payload["concurrency"] == 2
     for index in (1, 2, 3):
         assert nodes[f"hunter-{index}"]["depends_on"] == ["surface-split"]
         assert "hunter-1" not in nodes[f"hunter-{index}"]["depends_on"] or index == 1
@@ -533,7 +569,7 @@ def test_goal_ready_set_holds_judge_until_every_hunter(
     """Mechanical gate: judge-a is not ready until every hunter COMPLETED.
 
     Replicates pinned agentflow 09df0175 ready/skip rules. Must not rely on
-    declaration order or concurrency=1 FIFO of a hash set.
+    declaration order or concurrency FIFO of a hash set.
     """
     pytest.importorskip("agentflow")
     monkeypatch.setenv("GOAL_COUNT", "3")

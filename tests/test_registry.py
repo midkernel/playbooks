@@ -94,9 +94,12 @@ def test_readme_documents_openrouter_lock_and_default_targets() -> None:
     assert "openrouter_new_account" in readme
     assert "20 requests/minute" in readme
     assert "429" in readme
-    assert "serialized" in readme.lower() or "depends_on" in readme
+    assert "fan-out" in readme.lower() or "parallel" in readme.lower()
+    assert "depends_on" in readme
     assert "90s" in readme
-    assert "hunter-2..N never regain" in readme or "never regain a `surface-split` edge" in readme
+    assert "GOAL_CONCURRENCY" in readme
+    assert "default **2**" in readme
+    assert "`1|2|4|6`" in readme
     assert "cmtuvv61w0003gm0az74grqv2" in readme
     assert "AGENT_TIMEOUT_SECONDS" in readme
     assert "1620" in readme
