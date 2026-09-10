@@ -351,6 +351,9 @@ def test_goal_hunter_concurrency_defaults_to_two(monkeypatch: pytest.MonkeyPatch
     assert mk.goal_hunter_concurrency() == mk.MAX_GOAL_HUNTERS
     monkeypatch.setenv("GOAL_CONCURRENCY", "nope")
     assert mk.goal_concurrency_cap() == 2
+    monkeypatch.setenv("CONCURRENCY", "6")
+    monkeypatch.setenv("GOAL_CONCURRENCY", "2")
+    assert mk.goal_concurrency_cap() == 2
     monkeypatch.delenv("GOAL_CONCURRENCY", raising=False)
     monkeypatch.setenv("CONCURRENCY", "4")
     assert mk.goal_concurrency_cap() == 4
