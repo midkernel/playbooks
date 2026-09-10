@@ -399,9 +399,13 @@ def test_low_profile_goal_kimi_nodes_use_30_minute_timeout(
     assert nodes["hunter-1"]["depends_on"] == ["surface-split"]
     assert nodes["hunter-2"]["depends_on"] == ["surface-split"]
     assert "hunter-1" not in nodes["hunter-2"]["depends_on"]
-    assert nodes["judge-a"]["depends_on"] == ["surface-split"]
+    assert set(nodes["hunter-join"]["depends_on"]) == {"hunter-1", "hunter-2"}
+    assert nodes["hunter-join"]["on_failure_restart"] == ["hunter-join"]
+    assert nodes["judge-a"]["depends_on"] == ["hunter-join"]
     assert graph.to_payload()["fail_fast"] is False
     assert nodes["hunter-1"]["env"]["KIMI_MAX_TOKENS"] == "16384"
+    assert nodes["hunter-1"]["env"]["MIDKERNEL_HUNTER_CONTINUE"] == "1"
+    assert nodes["hunter-1"]["env"]["MIDKERNEL_NODE_TIMEOUT_SECONDS"] == "1800"
 
 
 def test_goal_graph_hunters_follow_goal_count(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -425,7 +429,8 @@ def test_goal_graph_hunters_follow_goal_count(monkeypatch: pytest.MonkeyPatch) -
         if set(nodes[hid]["depends_on"]) <= {"surface-split"}
     ]
     assert ready_after_split == ["hunter-1", "hunter-2", "hunter-3"]
-    assert nodes["judge-a"]["depends_on"] == ["surface-split"]
+    assert nodes["judge-a"]["depends_on"] == ["hunter-join"]
+    assert set(nodes["hunter-join"]["depends_on"]) == {"hunter-1", "hunter-2", "hunter-3"}
     payload = graph.to_payload()
     assert payload["concurrency"] == 1
     assert payload["fail_fast"] is False
@@ -458,7 +463,9 @@ def test_goal_graph_hunter_failure_does_not_fail_fast_siblings(
     assert "hunter-1" not in nodes["judge-a"]["depends_on"]
     assert "hunter-2" not in nodes["judge-a"]["depends_on"]
     assert "hunter-3" not in nodes["judge-a"]["depends_on"]
-    assert nodes["judge-a"]["depends_on"] == ["surface-split"]
+    assert nodes["judge-a"]["depends_on"] == ["hunter-join"]
+    assert nodes["hunter-join"]["on_failure_restart"] == ["hunter-join"]
+    assert set(nodes["hunter-join"]["depends_on"]) == {"hunter-1", "hunter-2", "hunter-3"}
     assert nodes["judge-b"]["depends_on"] == ["judge-a"]
     assert nodes["assemble"]["depends_on"] == ["judge-b"]
     assert nodes["publish"]["depends_on"] == ["assemble"]
@@ -522,6 +529,65 @@ def test_review_prompt_names_default_targets() -> None:
     assert "`main`" in firedancer
     assert "sanitizer" in firedancer.lower()
     assert "agave/" in firedancer
+
+
+def test_goal_ready_set_holds_judge_until_hunter_join(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mechanical gate: judge-a is not ready until hunter-join COMPLETED.
+
+    Replicates pinned agentflow 09df0175 ready/skip rules. Must not rely on
+    declaration order or concurrency=1 FIFO of a hash set.
+    """
+    pytest.importorskip("agentflow")
+    monkeypatch.setenv("GOAL_COUNT", "3")
+    payload = mk.build_goal_scan_graph(
+        "goal-security-review",
+        description="ready-set gate",
+    ).to_payload()
+    prefix = {"prepare", "threat-model", "goal-author", "surface-split"}
+    hunters = {"hunter-1", "hunter-2", "hunter-3"}
+
+    after_split = mk.agentflow_ready_node_ids(payload, completed=prefix)
+    assert after_split == hunters
+    assert "judge-a" not in after_split
+    assert "hunter-join" not in after_split
+
+    hunter1_failed = mk.agentflow_ready_node_ids(
+        payload,
+        completed=prefix,
+        failed={"hunter-1"},
+    )
+    assert hunter1_failed == {"hunter-2", "hunter-3"}
+    assert "hunter-join" not in hunter1_failed
+    assert "judge-a" not in hunter1_failed
+
+    all_hunters_failed = mk.agentflow_ready_node_ids(
+        payload,
+        completed=prefix,
+        failed=hunters,
+    )
+    assert all_hunters_failed == {"hunter-join"}
+    assert "judge-a" not in all_hunters_failed
+
+    mixed = mk.agentflow_ready_node_ids(
+        payload,
+        completed=prefix | {"hunter-1", "hunter-2"},
+        failed={"hunter-3"},
+    )
+    assert mixed == {"hunter-join"}
+    assert "judge-a" not in mixed
+
+    join_done = mk.agentflow_ready_node_ids(
+        payload,
+        completed=prefix | hunters | {"hunter-join"},
+    )
+    assert "judge-a" in join_done
+    assert "hunter-join" not in join_done
+
+    split_failed = mk.agentflow_ready_node_ids(payload, failed={"surface-split"})
+    assert "hunter-1" not in split_failed
+    assert "judge-a" not in split_failed
 
 
 def test_emit_is_side_effect_free_without_run(

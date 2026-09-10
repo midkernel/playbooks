@@ -104,6 +104,7 @@ NODE_LABELS = {
     "threat-model": "Threat model",
     "goal-author": "Goal author",
     "surface-split": "Surface split",
+    "hunter-join": "Hunter join",
     "judge-a": "Judge A",
     "judge-b": "Judge B",
     "assemble": "Assemble",
@@ -1678,6 +1679,8 @@ def kimi_io_env(
         env["MIDKERNEL_NODE_PARENT"] = parent_id or "surface-split"
     if is_dynamic_node(nid) if dynamic is None else dynamic:
         env["MIDKERNEL_NODE_DYNAMIC"] = "1"
+    if hunter_index(nid) is not None:
+        env["MIDKERNEL_HUNTER_CONTINUE"] = "1"
     return env
 
 
@@ -1755,6 +1758,76 @@ def _forward_kimi_probe(argv: list[str]) -> int:
     return _synthetic_kimi_probe(argv)
 
 
+HUNTER_INNER_TIMEOUT_RATIO = 0.9
+INCOMPLETE_HUNTER_MARKER = "This is **not** a security finding."
+
+
+def hunter_continue_enabled(node_id: str | None = None) -> bool:
+    nid = node_id or env_first("MIDKERNEL_NODE_ID")
+    return env_first("MIDKERNEL_HUNTER_CONTINUE") == "1" and hunter_index(nid or "") is not None
+
+
+def hunter_inner_timeout_seconds() -> int | None:
+    """Kill kimi before the graph hard timeout so the wrapper can exit 0.
+
+    Soft ratio matches playbook prompts (90% of ``MIDKERNEL_NODE_TIMEOUT_SECONDS``).
+    Agentflow SIGKILL at the hard timeout still marks the node FAILED; the
+    hunter-join cycle barrier covers that case.
+    """
+    raw = env_first("MIDKERNEL_NODE_TIMEOUT_SECONDS")
+    if not raw:
+        return None
+    try:
+        hard = int(raw)
+    except ValueError:
+        return None
+    if hard <= 0:
+        return None
+    return max(1, int(hard * HUNTER_INNER_TIMEOUT_RATIO))
+
+
+def hunter_result_paths(node_id: str) -> list[Path]:
+    rel = Path("findings") / safe_node_id(node_id) / "RESULT.md"
+    work = Path(workdir()).resolve()
+    repo = Path(repo_dir()).resolve()
+    cwd = Path.cwd().resolve()
+    bases = [repo, work]
+    # Agentflow success_criteria use the node cwd (GOAL hunters: $WORKDIR/repo).
+    # Never write into an unrelated process cwd (pytest root would pollute git).
+    if cwd in {repo, work}:
+        bases.insert(0, cwd)
+    seen: set[str] = set()
+    paths: list[Path] = []
+    for base in bases:
+        path = (base / rel)
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        paths.append(path)
+    return paths
+
+
+def hunter_result_exists(node_id: str) -> bool:
+    return any(path.is_file() and path.stat().st_size > 0 for path in hunter_result_paths(node_id))
+
+
+def ensure_incomplete_hunter_result(node_id: str, reason: str) -> None:
+    """Write a nonempty RESULT.md that judges must not score as a finding."""
+    body = (
+        f"# Incomplete hunter slot ({safe_node_id(node_id)})\n\n"
+        f"{INCOMPLETE_HUNTER_MARKER} "
+        "The hunter process timed out, exited non-zero, or did not write RESULT.md. "
+        "Score this slot as empty.\n\n"
+        f"Reason: {reason}\n"
+    )
+    for path in hunter_result_paths(node_id):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.is_file() and path.stat().st_size > 0:
+            continue
+        path.write_text(body, encoding="utf-8")
+
+
 def wrap_kimi(argv: list[str]) -> int:
     if _is_kimi_probe(argv):
         return _forward_kimi_probe(argv)
@@ -1812,9 +1885,14 @@ def wrap_kimi(argv: list[str]) -> int:
     )
     command = [binary, *argv]
     error = None
+    inner_timeout = hunter_inner_timeout_seconds() if hunter_continue_enabled(node_id) else None
     try:
-        result = subprocess.run(command, check=False, env=child_env)
+        result = subprocess.run(command, check=False, env=child_env, timeout=inner_timeout)
         code = int(result.returncode)
+    except subprocess.TimeoutExpired:
+        code = 124
+        error = f"soft deadline ({inner_timeout}s); writing incomplete RESULT.md"
+        print(f"node io: {error}", file=sys.stderr)
     except Exception as exc:  # noqa: BLE001
         code = 1
         error = str(exc)
@@ -1825,7 +1903,15 @@ def wrap_kimi(argv: list[str]) -> int:
     if code != 0 and not error:
         error = f"exit {code}"
     # Upload files the model actually wrote (RESULT.md / report.md / …).
-    # Never invent hunter findings or a stub RESULT.md on 402 / 429 / empty return.
+    # Never invent hunter findings on 402 / 429 / empty return unless this is
+    # a GOAL hunter with MIDKERNEL_HUNTER_CONTINUE=1 (graph node must exit 0
+    # so judge-a is not skipped; RESULT.md is marked incomplete, not a finding).
+    if hunter_continue_enabled(node_id) and (
+        code != 0 or not hunter_result_exists(node_id)
+    ):
+        ensure_incomplete_hunter_result(node_id, error or "missing RESULT.md")
+        finish_node(node_id, status="failed", error=error, outputs=parse_outputs(None))
+        return 0
     finish_node(node_id, status=status, error=error, outputs=parse_outputs(None))
     return code
 

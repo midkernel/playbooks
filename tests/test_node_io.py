@@ -786,6 +786,51 @@ def test_wrap_kimi_does_not_invent_hunter_result(
     assert not (tmp_path / "findings" / "hunter-1" / "RESULT.md").exists()
 
 
+def test_wrap_kimi_hunter_continue_writes_incomplete_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "kimi.bin"
+    fake.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setenv("MIDKERNEL_KIMI_BIN", str(fake))
+    monkeypatch.setenv("WORKDIR", str(tmp_path))
+    monkeypatch.setenv("RUN_ID", "run-hunter-continue")
+    monkeypatch.setenv("MIDKERNEL_IO_DIR", str(tmp_path / "s3"))
+    monkeypatch.setenv("MIDKERNEL_IO_SKIP_S3", "1")
+    monkeypatch.setenv("MIDKERNEL_NODE_IO", "1")
+    monkeypatch.setenv("MIDKERNEL_NODE_ID", "hunter-1")
+    monkeypatch.setenv("MIDKERNEL_NODE_OUTPUTS", "findings/hunter-1/RESULT.md")
+    monkeypatch.setenv("MIDKERNEL_HUNTER_CONTINUE", "1")
+    assert io.main(["-p", "hunt"]) == 0
+    result = tmp_path / "repo" / "findings" / "hunter-1" / "RESULT.md"
+    assert result.is_file()
+    text = result.read_text(encoding="utf-8")
+    assert io.INCOMPLETE_HUNTER_MARKER in text
+
+
+def test_wrap_kimi_hunter_continue_soft_timeout_exits_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "kimi.bin"
+    fake.write_text("#!/bin/sh\nexec sleep 30\n", encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setenv("MIDKERNEL_KIMI_BIN", str(fake))
+    monkeypatch.setenv("WORKDIR", str(tmp_path))
+    monkeypatch.setenv("RUN_ID", "run-hunter-soft-timeout")
+    monkeypatch.setenv("MIDKERNEL_IO_DIR", str(tmp_path / "s3"))
+    monkeypatch.setenv("MIDKERNEL_IO_SKIP_S3", "1")
+    monkeypatch.setenv("MIDKERNEL_NODE_IO", "1")
+    monkeypatch.setenv("MIDKERNEL_NODE_ID", "hunter-1")
+    monkeypatch.setenv("MIDKERNEL_NODE_OUTPUTS", "findings/hunter-1/RESULT.md")
+    monkeypatch.setenv("MIDKERNEL_HUNTER_CONTINUE", "1")
+    monkeypatch.setenv("MIDKERNEL_NODE_TIMEOUT_SECONDS", "2")
+    assert io.hunter_inner_timeout_seconds() == 1
+    assert io.main(["-p", "hunt"]) == 0
+    result = tmp_path / "repo" / "findings" / "hunter-1" / "RESULT.md"
+    assert result.is_file()
+    assert io.INCOMPLETE_HUNTER_MARKER in result.read_text(encoding="utf-8")
+
+
 def test_wrap_kimi_uploads_result_when_model_writes_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
