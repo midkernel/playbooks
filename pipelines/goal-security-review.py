@@ -19,7 +19,7 @@ emit_goal(
     description=(
         "Trail of Bits–style /goal security hunt: clone the target GitHub repo, "
         "write THREAT_MODEL.md, author GOAL_COUNT (default 6) outcome prompts, "
-        "run hunter-1..N sequentially (concurrency=1 siblings of surface-split; "
+        "run hunter-1..N in parallel (concurrency=N siblings of surface-split; "
         "hunters wrap to graph COMPLETED so judge-a depends_on every hunter; "
         "a hunter timeout does not fail the GOAL run), "
         "dual-pass OpenRouter judges, "

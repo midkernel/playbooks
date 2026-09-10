@@ -1,7 +1,7 @@
 ---
 name: goal-security-review
 slug: goal-security-review
-description: Trail of Bits–style /goal security hunt. Native agentflow graph (Kimi CLI via OpenRouter on midkernel-dev ECS). Threat model, authored goals, serialized hunter chain, dual-pass judges, report.md.
+description: Trail of Bits–style /goal security hunt. Native agentflow graph (Kimi CLI via OpenRouter on midkernel-dev ECS). Threat model, authored goals, parallel hunter fan-out, dual-pass judges, report.md.
 surface: scan
 kind: agentflow-graph
 pipeline: pipelines/goal-security-review.py

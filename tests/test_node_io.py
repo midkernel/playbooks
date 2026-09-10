@@ -130,33 +130,97 @@ def test_spawn_hunters_are_first_class_dynamic(io_home: Path) -> None:
     assert all(node["status"] == "pending" for node in hunters)
     pairs = {(edge["source"], edge["target"]) for edge in graph["edges"]}
     assert ("surface-split", "hunter-1") in pairs
-    assert ("hunter-1", "hunter-2") in pairs
-    assert ("hunter-2", "hunter-3") in pairs
-    assert ("surface-split", "hunter-2") not in pairs
-    assert ("surface-split", "hunter-3") not in pairs
+    assert ("surface-split", "hunter-2") in pairs
+    assert ("surface-split", "hunter-3") in pairs
+    assert ("hunter-1", "hunter-2") not in pairs
+    assert ("hunter-2", "hunter-3") not in pairs
     for index in range(1, 4):
         assert (f"hunter-{index}", "judge-a") in pairs
     again = io.spawn_hunters(3)
     assert len([n for n in again["nodes"] if n["id"].startswith("hunter-")]) == 3
 
 
-def test_hunter_graph_predecessor_is_serialized_not_parent() -> None:
-    """parentId is surface-split; the execution edge is the hunter chain."""
+def test_spawn_hunters_drops_leftover_serial_chain(io_home: Path) -> None:
+    io.init_graph(
+        [
+            io.graph_node_record("surface-split", kind="kimi"),
+            io.graph_node_record("hunter-1", kind="kimi", parent_id="surface-split", dynamic=True),
+            io.graph_node_record("hunter-2", kind="kimi", parent_id="surface-split", dynamic=True),
+            io.graph_node_record("judge-a", kind="kimi"),
+        ],
+        [
+            {"source": "surface-split", "target": "hunter-1"},
+            {"source": "hunter-1", "target": "hunter-2"},
+            {"source": "hunter-2", "target": "judge-a"},
+        ],
+    )
+    graph = io.spawn_hunters(2)
+    pairs = {(edge["source"], edge["target"]) for edge in graph["edges"]}
+    assert ("surface-split", "hunter-1") in pairs
+    assert ("surface-split", "hunter-2") in pairs
+    assert ("hunter-1", "hunter-2") not in pairs
+    assert ("hunter-1", "judge-a") in pairs
+    assert ("hunter-2", "judge-a") in pairs
+
+
+def test_bootstrap_goal_graph_fans_out_hunters(io_home: Path) -> None:
+    payload = {
+        "name": "goal-security-review",
+        "nodes": [
+            {
+                "id": "surface-split",
+                "agent": "kimi",
+                "prompt": "split",
+                "depends_on": ["goal-author"],
+            },
+            {
+                "id": "hunter-1",
+                "agent": "kimi",
+                "prompt": "h1",
+                "depends_on": ["surface-split"],
+            },
+            {
+                "id": "hunter-2",
+                "agent": "kimi",
+                "prompt": "h2",
+                "depends_on": ["surface-split"],
+            },
+            {
+                "id": "judge-a",
+                "agent": "kimi",
+                "prompt": "judge",
+                "depends_on": ["hunter-1", "hunter-2"],
+            },
+        ],
+    }
+    graph = io.bootstrap_run_io(payload)
+    pairs = {(edge["source"], edge["target"]) for edge in graph["edges"]}
+    assert ("surface-split", "hunter-1") in pairs
+    assert ("surface-split", "hunter-2") in pairs
+    assert ("hunter-1", "hunter-2") not in pairs
+    assert ("hunter-1", "judge-a") in pairs
+    assert ("hunter-2", "judge-a") in pairs
+
+
+def test_hunter_graph_predecessor_is_surface_split_fanout() -> None:
+    """Every hunter fans out from surface-split; leftover serial is hunter-(k-1)."""
     assert io.hunter_graph_predecessor("hunter-1") == "surface-split"
-    assert io.hunter_graph_predecessor("hunter-2") == "hunter-1"
-    assert io.hunter_graph_predecessor("hunter-6") == "hunter-5"
+    assert io.hunter_graph_predecessor("hunter-2") == "surface-split"
+    assert io.hunter_graph_predecessor("hunter-6") == "surface-split"
     assert io.hunter_graph_predecessor("judge-a") is None
     assert io.hunter_graph_predecessor("review") is None
+    assert io.leftover_serial_hunter_predecessor("hunter-1") is None
+    assert io.leftover_serial_hunter_predecessor("hunter-2") == "hunter-1"
+    assert io.leftover_serial_hunter_predecessor("hunter-6") == "hunter-5"
 
 
-def test_start_node_hunter_2_does_not_write_surface_split_edge(
+def test_start_node_hunter_2_keeps_surface_split_fanout(
     io_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Live path: start_node(hunter-2) must not reintroduce fan-out.
+    """Live path: start_node(hunter-2) must keep the surface-split fan-out.
 
-    parentId / MIDKERNEL_NODE_PARENT stay surface-split (UI grouping).
-    Reviewer 3 REQUEST_CHANGES on PR #12: update_node used to upsert
-    parentId → hunter-N on every start/finish.
+    parentId / MIDKERNEL_NODE_PARENT stay surface-split (UI grouping) and
+    that is also the ReactFlow / execution edge.
     """
     monkeypatch.setenv("MIDKERNEL_NODE_PARENT", "surface-split")
     monkeypatch.setenv("MIDKERNEL_NODE_DYNAMIC", "1")
@@ -173,9 +237,9 @@ def test_start_node_hunter_2_does_not_write_surface_split_edge(
     graph = _read_json(io_home, "runs/run-test/graph.json")
     pairs = {(edge["source"], edge["target"]) for edge in graph["edges"]}
     assert ("surface-split", "hunter-1") in pairs
-    assert ("surface-split", "hunter-2") not in pairs
-    assert ("surface-split", "hunter-3") not in pairs
-    assert ("hunter-1", "hunter-2") in pairs
+    assert ("surface-split", "hunter-2") in pairs
+    assert ("surface-split", "hunter-3") in pairs
+    assert ("hunter-1", "hunter-2") not in pairs
     assert ("hunter-2", "judge-a") in pairs
     hunter2 = next(node for node in graph["nodes"] if node["id"] == "hunter-2")
     assert hunter2["parentId"] == "surface-split"
@@ -183,12 +247,12 @@ def test_start_node_hunter_2_does_not_write_surface_split_edge(
     io.finish_node("hunter-2", status="completed", output_text="ok")
     graph = _read_json(io_home, "runs/run-test/graph.json")
     pairs = {(edge["source"], edge["target"]) for edge in graph["edges"]}
-    assert ("surface-split", "hunter-2") not in pairs
-    assert ("hunter-1", "hunter-2") in pairs
+    assert ("surface-split", "hunter-2") in pairs
+    assert ("hunter-1", "hunter-2") not in pairs
 
 
-def test_update_node_drops_leftover_surface_split_fanout(io_home: Path) -> None:
-    """If an old fan-out edge exists, start/finish must drop it."""
+def test_update_node_drops_leftover_serial_hunter_chain(io_home: Path) -> None:
+    """If an old hunter-1 → hunter-2 edge exists, start/finish must drop it."""
     io.init_graph(
         [
             io.graph_node_record("surface-split", kind="kimi"),
@@ -209,8 +273,8 @@ def test_update_node_drops_leftover_surface_split_fanout(io_home: Path) -> None:
     )
     graph = _read_json(io_home, "runs/run-test/graph.json")
     pairs = {(edge["source"], edge["target"]) for edge in graph["edges"]}
-    assert ("surface-split", "hunter-2") not in pairs
-    assert ("hunter-1", "hunter-2") in pairs
+    assert ("surface-split", "hunter-2") in pairs
+    assert ("hunter-1", "hunter-2") not in pairs
     assert ("hunter-2", "judge-a") in pairs
 
 
@@ -229,8 +293,8 @@ def test_surface_split_finish_spawns_hunters(io_home: Path, monkeypatch: pytest.
     assert "hunter-3" not in {node["id"] for node in graph["nodes"]}
     pairs = {(edge["source"], edge["target"]) for edge in graph["edges"]}
     assert ("surface-split", "hunter-1") in pairs
-    assert ("hunter-1", "hunter-2") in pairs
-    assert ("surface-split", "hunter-2") not in pairs
+    assert ("surface-split", "hunter-2") in pairs
+    assert ("hunter-1", "hunter-2") not in pairs
 
 
 def test_bootstrap_uploads_prompts_and_graph(io_home: Path) -> None:

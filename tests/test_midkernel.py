@@ -330,6 +330,14 @@ def test_goal_playbook_prompt_and_no_default_target() -> None:
     assert mk.default_target("goal-security-review") is None
 
 
+def test_goal_hunter_concurrency_matches_goal_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GOAL_COUNT", "4")
+    assert mk.goal_hunter_concurrency() == 4
+    assert mk.goal_hunter_concurrency(2) == 2
+    assert mk.goal_hunter_concurrency(99) == mk.MAX_GOAL_HUNTERS
+    assert mk.goal_hunter_concurrency(0) == 1
+
+
 def test_goal_prompts_omit_github_dedupe() -> None:
     hunter = mk.hunter_prompt("goal-security-review", 3)
     assert "goals/03-" in hunter
@@ -402,6 +410,7 @@ def test_low_profile_goal_kimi_nodes_use_30_minute_timeout(
     assert set(nodes["judge-a"]["depends_on"]) == {"hunter-1", "hunter-2"}
     assert "hunter-join" not in nodes
     assert graph.to_payload()["fail_fast"] is False
+    assert graph.to_payload()["concurrency"] == 2
     assert nodes["hunter-1"]["env"]["KIMI_MAX_TOKENS"] == "16384"
     assert nodes["hunter-1"]["env"]["MIDKERNEL_HUNTER_CONTINUE"] == "1"
     assert nodes["hunter-1"]["env"]["MIDKERNEL_NODE_TIMEOUT_SECONDS"] == "1800"
@@ -432,7 +441,7 @@ def test_goal_graph_hunters_follow_goal_count(monkeypatch: pytest.MonkeyPatch) -
     assert set(nodes["judge-a"]["depends_on"]) == {"hunter-1", "hunter-2", "hunter-3"}
     assert "hunter-join" not in nodes
     payload = graph.to_payload()
-    assert payload["concurrency"] == 1
+    assert payload["concurrency"] == 3
     assert payload["fail_fast"] is False
 
 
@@ -454,7 +463,7 @@ def test_goal_graph_hunter_failure_does_not_fail_fast_siblings(
     payload = graph.to_payload()
     nodes = {node["id"]: node for node in payload["nodes"]}
     assert payload["fail_fast"] is False
-    assert payload["concurrency"] == 1
+    assert payload["concurrency"] == 3
     for index in (1, 2, 3):
         assert nodes[f"hunter-{index}"]["depends_on"] == ["surface-split"]
         assert "hunter-1" not in nodes[f"hunter-{index}"]["depends_on"] or index == 1
@@ -533,7 +542,7 @@ def test_goal_ready_set_holds_judge_until_every_hunter(
     """Mechanical gate: judge-a is not ready until every hunter COMPLETED.
 
     Replicates pinned agentflow 09df0175 ready/skip rules. Must not rely on
-    declaration order or concurrency=1 FIFO of a hash set.
+    declaration order or concurrency FIFO of a hash set.
     """
     pytest.importorskip("agentflow")
     monkeypatch.setenv("GOAL_COUNT", "3")

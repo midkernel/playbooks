@@ -47,7 +47,7 @@ def _assert_goal_hunters_continue_on_fail(
 
     Agentflow skips dependents of FAILED nodes (upstream_failure) even when
     fail_fast is False. A hunter-1 → hunter-2 chain would abort hunter-2..N
-    (QA cmtuvv61w0003gm0az74grqv2). Serialization is concurrency=1. Hunters
+    (QA cmtuvv61w0003gm0az74grqv2). Parallelism is concurrency=N. Hunters
     wrap to graph COMPLETED so judge-a can hard-depends_on them and a
     hunter timeout does not fail the GOAL run.
     """
@@ -64,7 +64,7 @@ def _assert_goal_hunters_continue_on_fail(
     assert "hunter-join" not in nodes
     if spec is not None:
         assert spec["fail_fast"] is False
-        assert spec["concurrency"] == 1
+        assert spec["concurrency"] == count
 
 
 def _load(slug: str, env: dict[str, str] | None = None) -> dict:
@@ -209,7 +209,7 @@ def test_goal_security_review_graph_nodes_and_openrouter_lock() -> None:
     assert tuple(nodes) == GOAL_NODES or set(nodes) == set(GOAL_NODES)
     assert set(nodes) == set(GOAL_NODES)
 
-    assert spec["concurrency"] == 1
+    assert spec["concurrency"] == 6
     assert spec["fail_fast"] is False
     assert nodes["threat-model"]["depends_on"] == ["prepare"]
     assert nodes["goal-author"]["depends_on"] == ["threat-model"]
@@ -314,7 +314,7 @@ def test_goal_security_review_hunters_follow_goal_count() -> None:
         "publish",
     }
     _assert_goal_hunters_continue_on_fail(nodes, 2, spec)
-    assert spec["concurrency"] == 1
+    assert spec["concurrency"] == 2
     assert spec["fail_fast"] is False
     assert set(nodes["judge-a"]["depends_on"]) == {"hunter-1", "hunter-2"}
 
@@ -345,7 +345,7 @@ def test_goal_security_review_hunter_failure_does_not_fail_fast() -> None:
     """Hunter hard-fail must not skip siblings or judges (QA cmtuvv61w0003gm0az74grqv2)."""
     spec = _load(GOAL_SLUG)
     nodes = {node["id"]: node for node in spec["nodes"]}
-    assert spec["concurrency"] == 1
+    assert spec["concurrency"] == 6
     assert spec["fail_fast"] is False
     _assert_goal_hunters_continue_on_fail(nodes, 6, spec)
     for index in range(1, 7):

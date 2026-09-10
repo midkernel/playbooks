@@ -932,22 +932,31 @@ def assemble_prompt(slug: str) -> str:
     )
 
 
-def attach_goal_hunters(split, hunters) -> None:
-    """All hunters depend only on ``surface-split`` (siblings).
+def goal_hunter_concurrency(count: int | None = None) -> int:
+    """Graph-wide slots so every hunter sibling can run at once.
 
-    Serialization is ``Graph(concurrency=1)``, not a ``depends_on`` chain.
+    Sequential prefix/suffix stay ordered by ``depends_on``. ``judge-a``
+    still waits on every hunter. ``count`` is ``GOAL_COUNT`` (1..6).
+    """
+    n = goal_count() if count is None else int(count)
+    return max(1, min(n, MAX_GOAL_HUNTERS))
+
+
+def attach_goal_hunters(split, hunters) -> None:
+    """All hunters depend only on ``surface-split`` (siblings / fan-out).
+
     Agentflow skips a node when any ``depends_on`` parent is FAILED
     (``upstream_failure``), even if ``fail_fast`` is False. Chaining
     ``hunter-k >> hunter-(k+1)`` therefore aborts later hunters when hunter-k
-    times out (QA ``cmtuvv61w0003gm0az74grqv2``).
+    times out (QA ``cmtuvv61w0003gm0az74grqv2``). Do **not** serialize
+    hunters with a ``depends_on`` chain.
 
-    Do not raise ``concurrency`` on this fan-out — parallel hunters are the
-    OpenRouter 429 (run ``cmtun51000003l704q7lyyjrf``).
+    Parallel execution is ``Graph(concurrency=N)`` matching ``GOAL_COUNT``.
+    ``concurrency=1`` was the 429 workaround (run ``cmtun51000003l704q7lyyjrf``)
+    and is what made ReactFlow / the runner look serial. OpenRouter 429 is
+    mitigated by ``wrap_kimi`` Retry-After (up to 90s / 8 tries).
 
-    Declaration order / FIFO does **not** keep ``judge-a`` behind hunters.
-    After ``surface-split``, the pinned orchestrator builds ``remaining`` as a
-    set and ``concurrency=1`` only serializes that arbitrary ready set. The
-    gate is ``judge-a depends_on`` every hunter. Hunters must always
+    The gate is ``judge-a depends_on`` every hunter. Hunters must always
     COMPLETE from agentflow's view (exit-0 wrap) so that edge is safe and
     a hunter timeout does not fail the whole run.
     """
@@ -1028,7 +1037,7 @@ def build_goal_scan_graph(slug: str, *, description: str):
 
     Hunters are first-class dynamic nodes ``hunter-1``…``hunter-N`` from
     ``GOAL_COUNT`` (default 6, max 6). They all depend on ``surface-split``
-    (siblings) and run one at a time via ``concurrency=1``. Wrap exits 0
+    (siblings) and run in parallel via ``concurrency=N``. Wrap exits 0
     with RESULT.md so each hunter is COMPLETED even on kimi timeout /
     non-zero (UI meta still records incomplete). ``judge-a`` then
     ``depends_on`` every hunter. ``fail_fast=False`` so an unexpected
@@ -1048,7 +1057,7 @@ def build_goal_scan_graph(slug: str, *, description: str):
         slug,
         description=description,
         working_dir=".",
-        concurrency=1,
+        concurrency=goal_hunter_concurrency(hunters_n),
         fail_fast=False,
     ) as graph:
         prepare = shell(
