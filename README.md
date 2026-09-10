@@ -83,14 +83,14 @@ From `pipelines/_midkernel.py` / app `AGENTFLOW_DEV_DEFAULTS`:
 
 `ECSTarget` in agentflow (pinned runner ref `09df0175ff2c88528c99b9f2c22f25b5e7622a8e`) accepts cluster, image, subnets, security groups, `assign_public_ip`, cpu/memory. It does **not** accept execution/task role ARNs or log group — those stay on the app-registered task definition.
 
-Profile sizes (same as runner docs): `low` 1 vCPU / 2 GiB, `balanced` 2 / 4, `max` 4 / 8. Timeouts 15 / 30 / 60 minutes.
+Profile sizes (same as runner docs): `low` 1 vCPU / 2 GiB, `balanced` 2 / 4, `max` 4 / 8. Per-node timeouts 30 / 30 / 60 minutes (`low` matches former `balanced` after QA `cmtutkn8k0003id04hs5s8j7z` hunter-1 exit 124 at 900s).
 
 ## Environment contract
 
 Coordinate names with `midkernel/app` (`src/lib/agentflow-contract.ts`) and `midkernel/runner`. The graph accepts **both** spellings until those repos converge. Prefer the app names on `RunTask`.
 
 | App (`AGENT_ENV`) | Runner alias | Required | Notes |
-| --- | --- | --- | --- |
+| --- | --- |
 | `RUN_ID` | `RUN_ID` | yes | Artifact key segment. `[A-Za-z0-9._:-]{1,128}` |
 | `GITHUB_OWNER` | same | playbook | Target owner. Required unless the playbook sets `target_repo` |
 | `GITHUB_NAME` | same | playbook | Target name. Required unless the playbook sets `target_repo` |
@@ -143,7 +143,7 @@ Root cause (not a retry tweak): Midkernel config sets `max_context_size = 262144
 Definitive playbooks patch (lockstep with runner):
 
 1. Default `max_tokens` **16384** on every Kimi invocation in `emit()` / `emit_goal()`.
-2. Env override, **first-wins** (same as runner): `MIDKERNEL_OPENROUTER_MAX_TOKENS`, `OPENROUTER_MAX_TOKENS`, `KIMI_MAX_TOKENS`, `KIMI_MODEL_MAX_TOKENS`, `KIMI_MODEL_MAX_COMPLETION_TOKENS`. Hard ceiling **65536**. `131072` is **not** a valid opt-in (that is the exact 402 reservation) — values `>65536` or `>=131072` become **16384**.
+2. Env override, **first-wins** (same as runner): `MIDKERNEL_OPENROUTER_MAX_TOKENS`, `OPENROUTER_MAX_TOKENS`, `KIMI_MAX_TOKENS`, `KIMI_MODEL_MAX_TOKENS`, `KIMI_MODEL_MAX_COMPLETION_TOKENS`. Hard ceiling **65536**. `131072` is **not** a valid opt-in (that is the exact 402 reservation) — values `>65536` or `>=131072` become **16384`.
 3. Prepare / `render_kimi_openrouter_config` write `max_tokens = 16384` next to `max_context_size = 262144` (lockstep with runner). `max_output_size` is also written; kimi-cli `openai_legacy` does not honor it.
 4. `wrap_kimi` proxies OpenRouter and **never forwards** a `chat/completions` request without a capped `max_tokens` on the JSON body. Empty body, missing Content-Length, or a body without `max_tokens` → inject the clamped cap. Non-JSON → HTTP 400 (do not pass through). A request body of `max_tokens: 131072` is rewritten to `16384`.
 5. Hunter success criteria still require `findings/hunter-N/RESULT.md`. Wrap uploads that file when the model actually writes it. Wrap does **not** invent findings or a stub `RESULT.md` on 402 / empty return.
