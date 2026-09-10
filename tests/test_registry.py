@@ -97,3 +97,5 @@ def test_readme_documents_openrouter_lock_and_default_targets() -> None:
     assert "serialized" in readme.lower() or "depends_on" in readme
     assert "90s" in readme
     assert "hunter-2..N never regain" in readme or "never regain a `surface-split` edge" in readme
+    assert "30 / 30 / 60" in readme
+    assert "cmtutkn8k0003id04hs5s8j7z" in readme
