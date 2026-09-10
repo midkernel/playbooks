@@ -140,7 +140,7 @@ PROFILE_FARGATE = {
 }
 
 PROFILE_TIMEOUT_SECONDS = {
-    "low": 15 * 60,
+    "low": 30 * 60,
     "balanced": 30 * 60,
     "max": 60 * 60,
 }
