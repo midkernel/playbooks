@@ -178,3 +178,17 @@ def env_first(*names: str, default: str = "") -> str:
 def scan_profile() -> str:
     profile = env_first("PROFILE", "SCAN_PROFILE", default="balanced").lower()
     return profile if profile in PROFILE_FARGATE else "balanced"
+
+
+def normalize_openrouter_model(raw: str, *, default: str = DEFAULT_OPENROUTER_MODEL) -> str:
+    slug = (raw or "").strip()
+    if slug.startswith("openrouter/"):
+        slug = slug[len("openrouter/") :]
+    if "/" not in slug:
+        return default
+    return slug
+
+
+def openrouter_model() -> str:
+    raw = env_first("OPENROUTER_MODEL", "MODEL", default=DEFAULT_OPENROUTER_MODEL)
+    return normalize_openrouter_model(raw, default=DEFAULT_OPENROUTER_MODEL)
