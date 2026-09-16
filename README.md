@@ -2,7 +2,9 @@
 
 MIT-licensed public playbooks: Midkernel default runs and third-party agent units users can customize.
 
-Execution is **native [agentenv/agentflow](https://github.com/agentenv/agentflow)** (Python Graph API) with the **Kimi CLI harness via OpenRouter** (not Bedrock, not AI Gateway). OpenCode is **not required** — it was only an example. Do not build or block on an OpenCode adapter. The hard lock is **OpenRouter** for models.
+Execution is native [agentenv/agentflow](https://github.com/agentenv/agentflow) (Python Graph API). Public runs default to the Kimi CLI through OpenRouter. The same graphs support official Codex or Claude adapters when the private runner selects `MIDKERNEL_ADMIN_INFERENCE`; workspace preparation and Run UI telemetry are provider-independent.
+
+OpenCode is not required by these graphs.
 
 Private Midkernel-only skills live in the private `skills` repo.
 
@@ -13,7 +15,7 @@ Private Midkernel-only skills live in the private `skills` repo.
 | `<slug>.md` at repo root | Humans, MCP `list_playbooks`, app registry listing |
 | `pipelines/<slug>.py` | Execution. `agentflow run` / `agentflow validate` |
 | `pipelines/_midkernel.py` | Shared ECS target, env aliases, OpenRouter/Kimi + S3 helpers. Not a playbook |
-| `pipelines/_node_io.py` | Per-node I/O + live `graph.json`. Kimi `executable` |
+| `pipelines/_node_io.py` | Per-node I/O + live `graph.json`; delegates to the configured agent executable |
 | `scripts/ecs-in-task.sh` | Drop-in for runner: in-task `agentflow run` |
 
 Root markdown keeps `list_playbooks` working. The Midkernel Scan plugin walks **root** `.md` / `.yml` / `.yaml` / `.json` and optional `playbooks/`, `workflows/`, or `registry/` directories. It does **not** walk `pipelines/`, so graph files do not pollute the listing. `README.md` and `LICENSE` are ignored.
@@ -30,6 +32,10 @@ YAML frontmatter on each `<slug>.md`:
 | `target_repo`, `target_ref` | Optional default clone (`owner/name` + git ref) when `GITHUB_OWNER` / `GITHUB_NAME` / `GITHUB_REF` are unset |
 
 The markdown **body** (after frontmatter) is the skill prompt. The graph loads it at build time. App `list_playbooks` / `GET /api/playbooks` should keep pointing at `<slug>.md` on `main`. Do not change the default slug `security-review` or path `security-review.md`.
+
+### Official inference overlay
+
+`MIDKERNEL_ADMIN_INFERENCE=codex|claude` (subscription aliases are accepted) makes prepare skip all OpenRouter secret/config work. `_node_io.py` remains the node executable and delegates AgentFlow's argv to `MIDKERNEL_CODEX_BIN` / `MIDKERNEL_CLAUDE_BIN` (default `codex` / `claude`) while retaining prompt, output, status, timeout, and dynamic-hunter artifacts. Public repositories can be cloned without `GITHUB_TOKEN`; private repositories still require a token. The private adapter must preserve the playbook `executable` when it rewrites Kimi graph nodes to Codex or Claude.
 
 ## How Midkernel app starts a graph
 

@@ -28,9 +28,10 @@ shared task disk only when a run is actually executing so in-task nodes
 (``MIDKERNEL_AGENTFLOW_TARGET=local``) can upload without importing
 ``pipelines``. Graph emit / ``agentflow validate`` stay side-effect free:
 no disk or S3 writes unless ``node_io_enabled()``. Shell nodes wrap
-start/finish around the existing script. Kimi nodes set ``executable`` to
+start/finish around the existing script. Agent nodes set ``executable`` to
 this file so the same process uploads prompt at start and output + meta on
-success or failure.
+success or failure. The wrapper delegates to Kimi, Codex, or Claude according
+to ``MIDKERNEL_ADMIN_INFERENCE`` / ``MIDKERNEL_INFERENCE``.
 
 Final ``report.md`` still uses the existing publish stub-refusal path.
 """
@@ -64,6 +65,12 @@ DEFAULT_GOAL_COUNT = 6
 MAX_GOAL_HUNTERS = 6
 IMAGE_KIMI_BIN = "/opt/midkernel/kimi.bin"
 KIMI_PROBE_FLAGS = {"--version", "-V", "--help", "-h"}
+AGENT_PROBE_FLAGS = KIMI_PROBE_FLAGS
+INFERENCE_ENV_NAMES = ("MIDKERNEL_ADMIN_INFERENCE", "MIDKERNEL_INFERENCE")
+INFERENCE_ALIASES = {
+    "codex_subscription": "codex",
+    "claude_subscription": "claude",
+}
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 # Fallback only. App SCAN_MODEL_BY_PROFILE injects OPENROUTER_MODEL / MODEL
 # per Scan profile. Balanced Pareto Scan preset is the documented default.
@@ -117,6 +124,12 @@ def env_first(*names: str, default: str = "") -> str:
         if value:
             return value
     return default
+
+
+def configured_inference() -> str:
+    """Configured agent harness; public graphs remain Kimi by default."""
+    raw = env_first(*INFERENCE_ENV_NAMES, default="kimi").lower()
+    return INFERENCE_ALIASES.get(raw, raw)
 
 
 def clamp_kimi_max_tokens(value: int) -> int:
@@ -1012,7 +1025,8 @@ def graph_from_pipeline(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], 
     edges: list[dict[str, Any]] = []
     for raw in payload.get("nodes") or []:
         nid = str(raw["id"])
-        kind = "kimi" if raw.get("agent") == "kimi" else "shell"
+        raw_agent = str(raw.get("agent") or "shell").lower()
+        kind = raw_agent if raw_agent != "shell" else "shell"
         nodes.append(
             graph_node_record(
                 nid,
@@ -1674,7 +1688,7 @@ def kimi_io_env(
     env.update(
         {
             "MIDKERNEL_NODE_ID": nid,
-            "MIDKERNEL_NODE_KIND": "kimi",
+            "MIDKERNEL_NODE_KIND": configured_inference(),
             "MIDKERNEL_NODE_LABEL": label or node_label(nid),
             "MIDKERNEL_NODE_OUTPUTS": ",".join(outputs or []),
             "MIDKERNEL_NODE_IO": "1",
@@ -1766,6 +1780,32 @@ def _forward_kimi_probe(argv: list[str]) -> int:
     return _synthetic_kimi_probe(argv)
 
 
+def official_agent_bin(inference: str | None = None) -> str:
+    """Resolve an official subscription agent without changing its auth home."""
+    selected = inference or configured_inference()
+    if selected == "codex":
+        return env_first("MIDKERNEL_CODEX_BIN", "MIDKERNEL_AGENT_BIN", default="codex")
+    if selected == "claude":
+        return env_first("MIDKERNEL_CLAUDE_BIN", "MIDKERNEL_AGENT_BIN", default="claude")
+    raise ValueError(f"unsupported official inference: {selected}")
+
+
+def _official_prompt(argv: list[str], inference: str) -> str:
+    if inference == "claude":
+        return _prompt_from_kimi_argv(argv)
+    # Agentflow's Codex adapter appends the prompt after every option.
+    return argv[-1] if argv and argv[-1] not in AGENT_PROBE_FLAGS else ""
+
+
+def _forward_official_probe(argv: list[str], inference: str) -> int:
+    binary = official_agent_bin(inference)
+    try:
+        return int(subprocess.run([binary, *argv], check=False).returncode)
+    except OSError as exc:
+        print(f"node io: {inference} probe failed ({binary}): {exc}", file=sys.stderr)
+        return 1
+
+
 HUNTER_INNER_TIMEOUT_RATIO = 0.9
 INCOMPLETE_HUNTER_MARKER = "This is **not** a security finding."
 
@@ -1848,6 +1888,53 @@ def complete_hunter_continue(node_id: str, error: str | None) -> int:
     except Exception as exc:  # noqa: BLE001
         print(f"node io: hunter continue finish failed: {exc}", file=sys.stderr)
     return 0
+
+
+def wrap_official_agent(argv: list[str], inference: str | None = None) -> int:
+    """Run Codex/Claude with the same Run UI lifecycle as Kimi nodes."""
+    selected = inference or configured_inference()
+    if argv and argv[0] in AGENT_PROBE_FLAGS:
+        return _forward_official_probe(argv, selected)
+    node_id = env_first("MIDKERNEL_NODE_ID") or selected
+    prompt = _official_prompt(argv, selected)
+    if node_io_enabled():
+        install_runtime()
+    start_node(
+        node_id,
+        prompt=prompt,
+        kind=selected,
+        label=env_first("MIDKERNEL_NODE_LABEL") or None,
+        model=env_first(
+            "MIDKERNEL_EFFECTIVE_MODEL",
+            "MIDKERNEL_ADMIN_MODEL",
+            "MIDKERNEL_ADMIN_OFFERING",
+        ) or None,
+        parent_id=env_first("MIDKERNEL_NODE_PARENT") or None,
+        dynamic=env_first("MIDKERNEL_NODE_DYNAMIC") == "1" or None,
+    )
+    binary = official_agent_bin(selected)
+    error = None
+    inner_timeout = hunter_inner_timeout_seconds() if hunter_continue_enabled(node_id) else None
+    try:
+        result = subprocess.run([binary, *argv], check=False, timeout=inner_timeout)
+        code = int(result.returncode)
+    except subprocess.TimeoutExpired:
+        code = 124
+        error = f"soft deadline ({inner_timeout}s); writing incomplete RESULT.md"
+    except Exception as exc:  # noqa: BLE001
+        code = 1
+        error = str(exc)
+    if code != 0 and not error:
+        error = f"exit {code}"
+    if hunter_continue_enabled(node_id) and (code != 0 or not hunter_result_exists(node_id)):
+        return complete_hunter_continue(node_id, error or "missing RESULT.md")
+    finish_node(
+        node_id,
+        status="completed" if code == 0 else "failed",
+        error=error,
+        outputs=parse_outputs(None),
+    )
+    return code
 
 
 def wrap_kimi(argv: list[str]) -> int:
@@ -2011,6 +2098,9 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] in {"start", "finish", "init", "spawn-hunters"}:
         return _cli(argv)
+    inference = configured_inference()
+    if inference in {"codex", "claude"}:
+        return wrap_official_agent(argv, inference)
     return wrap_kimi(argv)
 
 

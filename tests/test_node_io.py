@@ -473,6 +473,46 @@ def test_version_and_help_forward_to_real_kimi_without_node_io(
     assert "kimi-probe-ok" in captured.out
 
 
+def test_official_codex_wrapper_preserves_node_telemetry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "codex"
+    fake.write_text("#!/bin/sh\necho codex-ran \"$@\"\n", encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setenv("MIDKERNEL_ADMIN_INFERENCE", "codex_subscription")
+    monkeypatch.setenv("MIDKERNEL_CODEX_BIN", str(fake))
+    monkeypatch.setenv("WORKDIR", str(tmp_path))
+    monkeypatch.setenv("RUN_ID", "run-wrap-codex")
+    monkeypatch.setenv("MIDKERNEL_IO_DIR", str(tmp_path / "s3"))
+    monkeypatch.setenv("MIDKERNEL_IO_SKIP_S3", "1")
+    monkeypatch.setenv("MIDKERNEL_NODE_IO", "1")
+    monkeypatch.setenv("MIDKERNEL_NODE_ID", "review")
+    monkeypatch.setenv("MIDKERNEL_ADMIN_OFFERING", "daybreak-blue")
+    assert io.main(["exec", "--json", "review this fixture"]) == 0
+    root = tmp_path / "s3" / "runs/run-wrap-codex/nodes/review"
+    assert "review this fixture" in (root / "prompt.md").read_text(encoding="utf-8")
+    meta = json.loads((root / "meta.json").read_text(encoding="utf-8"))
+    assert meta["status"] == "completed"
+    assert meta["model"] == "daybreak-blue"
+    graph = json.loads((tmp_path / "s3" / "runs/run-wrap-codex/graph.json").read_text(encoding="utf-8"))
+    assert graph["nodes"][0]["kind"] == "codex"
+
+
+def test_official_probe_uses_selected_binary_without_node_io(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "codex"
+    fake.write_text("#!/bin/sh\necho codex-probe \"$@\"\n", encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setenv("MIDKERNEL_ADMIN_INFERENCE", "codex")
+    monkeypatch.setenv("MIDKERNEL_CODEX_BIN", str(fake))
+    monkeypatch.setenv("WORKDIR", str(tmp_path / "missing"))
+    monkeypatch.delenv("RUN_ID", raising=False)
+    monkeypatch.delenv("MIDKERNEL_NODE_IO", raising=False)
+    assert io.main(["--version"]) == 0
+    assert not (tmp_path / "missing").exists()
+
+
 def test_version_succeeds_without_real_kimi_bin(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

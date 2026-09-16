@@ -424,8 +424,7 @@ def review_prompt(slug: str) -> str:
         )
     return (
         f"{skill}\n\n"
-        "You are Midkernel Scan running as the Kimi CLI harness on OpenRouter only "
-        "(not Bedrock, not AI Gateway). OpenCode is not part of this path.\n\n"
+        "You are Midkernel Scan running through the configured AgentFlow inference harness.\n\n"
         "Workspace:\n"
         f"{clone_line}\n"
         f"- Read RUN_ID, PLAYBOOK/PLAYBOOK_SLUG, PROFILE/SCAN_PROFILE, "
@@ -464,6 +463,11 @@ KIMI_MAX_TOKENS="${MIDKERNEL_OPENROUTER_MAX_TOKENS:-${OPENROUTER_MAX_TOKENS:-${K
 OPENROUTER_SECRET_ID="${OPENROUTER_SECRET_ID:-midkernel/dev/harness/openrouter-api-key}"
 GITHUB_TOKEN_SECRET_ID="${GITHUB_TOKEN_SECRET_ID:-midkernel/dev/harness/github-token}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
+INFERENCE="${MIDKERNEL_ADMIN_INFERENCE:-${MIDKERNEL_INFERENCE:-kimi}}"
+case "$INFERENCE" in
+  codex_subscription) INFERENCE=codex ;;
+  claude_subscription) INFERENCE=claude ;;
+esac
 __DEFAULT_CLONE__
 : "${RUN_ID:?RUN_ID is required}"
 : "${GITHUB_OWNER:?GITHUB_OWNER is required (no default target for this playbook)}"
@@ -500,7 +504,7 @@ if [ -x /opt/midkernel/kimi.bin ]; then
 fi
 echo "node io: prepare WORKDIR=$WORKDIR RUN_ID=${RUN_ID:-unset} MIDKERNEL_NODE_IO=$MIDKERNEL_NODE_IO MIDKERNEL_AGENTFLOW_TARGET=${MIDKERNEL_AGENTFLOW_TARGET:-} MIDKERNEL_KIMI_BIN=${MIDKERNEL_KIMI_BIN:-unset}" >&2
 
-python3 - "$OPENROUTER_SECRET_ID" "$GITHUB_TOKEN_SECRET_ID" "$AWS_REGION" <<'PY'
+python3 - "$OPENROUTER_SECRET_ID" "$GITHUB_TOKEN_SECRET_ID" "$AWS_REGION" "$INFERENCE" <<'PY'
 import json, os, sys
 
 def load_secret(secret_id: str, region: str) -> str:
@@ -533,9 +537,9 @@ def load_secret(secret_id: str, region: str) -> str:
         return ""
     return raw
 
-secret_id, gh_secret_id, region = sys.argv[1], sys.argv[2], sys.argv[3]
+secret_id, gh_secret_id, region, inference = sys.argv[1:5]
 workdir = os.environ.get("WORKDIR", "/workspace")
-if not os.environ.get("OPENROUTER_API_KEY", "").strip() and os.environ.get("MIDKERNEL_LOCAL") != "1":
+if inference == "kimi" and not os.environ.get("OPENROUTER_API_KEY", "").strip() and os.environ.get("MIDKERNEL_LOCAL") != "1":
     value = load_secret(secret_id, region)
     if value:
         for dest in (
@@ -549,11 +553,11 @@ if not os.environ.get("GITHUB_TOKEN", "").strip() and os.environ.get("MIDKERNEL_
         print(value, file=open(os.environ["HOME"] + "/.midkernel-github", "w"))
 PY
 
-if [ -z "${OPENROUTER_API_KEY:-}" ] && [ -f "$WORKDIR/.midkernel-openrouter" ]; then
+if [ "$INFERENCE" = "kimi" ] && [ -z "${OPENROUTER_API_KEY:-}" ] && [ -f "$WORKDIR/.midkernel-openrouter" ]; then
   OPENROUTER_API_KEY="$(tr -d '\n' < "$WORKDIR/.midkernel-openrouter")"
   export OPENROUTER_API_KEY
 fi
-if [ -z "${OPENROUTER_API_KEY:-}" ] && [ -f "$HOME/.midkernel-openrouter" ]; then
+if [ "$INFERENCE" = "kimi" ] && [ -z "${OPENROUTER_API_KEY:-}" ] && [ -f "$HOME/.midkernel-openrouter" ]; then
   OPENROUTER_API_KEY="$(tr -d '\n' < "$HOME/.midkernel-openrouter")"
   export OPENROUTER_API_KEY
 fi
@@ -562,25 +566,25 @@ if [ -z "${GITHUB_TOKEN:-}" ] && [ -f "$HOME/.midkernel-github" ]; then
   export GITHUB_TOKEN
 fi
 
-if [ -z "${OPENROUTER_API_KEY:-}" ]; then
-  echo "OPENROUTER_API_KEY is missing (set env or Secrets Manager midkernel/dev/harness/openrouter-api-key)" >&2
-  exit 2
-fi
-export OPENAI_API_KEY="$OPENROUTER_API_KEY"
-export KIMI_API_KEY="$OPENROUTER_API_KEY"
-export OPENAI_BASE_URL="https://openrouter.ai/api/v1"
+if [ "$INFERENCE" = "kimi" ]; then
+  if [ -z "${OPENROUTER_API_KEY:-}" ]; then
+    echo "OPENROUTER_API_KEY is missing (set env or Secrets Manager midkernel/dev/harness/openrouter-api-key)" >&2
+    exit 2
+  fi
+  export OPENAI_API_KEY="$OPENROUTER_API_KEY"
+  export KIMI_API_KEY="$OPENROUTER_API_KEY"
+  export OPENAI_BASE_URL="https://openrouter.ai/api/v1"
 
-# Persist key + config on the shared task disk. Later Kimi nodes run with
-# cwd=$WORKDIR/repo and BASH_ENV=/dev/null (runner prepare_node skipped),
-# so $HOME/.kimi/config.toml alone is not enough.
-printf '%s' "$OPENROUTER_API_KEY" > "$WORKDIR/.midkernel-openrouter"
-chmod 600 "$WORKDIR/.midkernel-openrouter" || true
-if [ -n "${HOME:-}" ]; then
-  printf '%s' "$OPENROUTER_API_KEY" > "$HOME/.midkernel-openrouter"
-  chmod 600 "$HOME/.midkernel-openrouter" || true
-fi
+  # Persist key + config on the shared task disk. Later Kimi nodes run with
+  # cwd=$WORKDIR/repo and BASH_ENV=/dev/null (runner prepare_node skipped).
+  printf '%s' "$OPENROUTER_API_KEY" > "$WORKDIR/.midkernel-openrouter"
+  chmod 600 "$WORKDIR/.midkernel-openrouter" || true
+  if [ -n "${HOME:-}" ]; then
+    printf '%s' "$OPENROUTER_API_KEY" > "$HOME/.midkernel-openrouter"
+    chmod 600 "$HOME/.midkernel-openrouter" || true
+  fi
 
-cat > "$KIMI_SHARE_DIR/config.toml" <<EOF
+  cat > "$KIMI_SHARE_DIR/config.toml" <<EOF
 default_model = "midkernel"
 default_thinking = false
 default_yolo = true
@@ -597,16 +601,17 @@ max_context_size = 262144
 max_tokens = ${KIMI_MAX_TOKENS}
 max_output_size = ${KIMI_MAX_TOKENS}
 EOF
-chmod 600 "$KIMI_SHARE_DIR/config.toml" || true
-cp "$KIMI_SHARE_DIR/config.toml" "$HOME/.kimi/config.toml"
-chmod 600 "$HOME/.kimi/config.toml" || true
+  chmod 600 "$KIMI_SHARE_DIR/config.toml" || true
+  cp "$KIMI_SHARE_DIR/config.toml" "$HOME/.kimi/config.toml"
+  chmod 600 "$HOME/.kimi/config.toml" || true
+fi
 
 if [ ! -d "$REPO_DIR/.git" ]; then
-  if [ -z "${GITHUB_TOKEN:-}" ]; then
-    echo "GITHUB_TOKEN is missing (set env or Secrets Manager midkernel/dev/harness/github-token)" >&2
-    exit 2
+  if [ -n "${GITHUB_TOKEN:-}" ]; then
+    CLONE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_OWNER}/${GITHUB_NAME}.git"
+  else
+    CLONE_URL="https://github.com/${GITHUB_OWNER}/${GITHUB_NAME}.git"
   fi
-  CLONE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_OWNER}/${GITHUB_NAME}.git"
   rm -rf "$REPO_DIR"
   if [ -n "${GITHUB_REF:-}" ]; then
     git clone --depth 1 --no-recurse-submodules --branch "$GITHUB_REF" "$CLONE_URL" "$REPO_DIR"
@@ -615,7 +620,7 @@ if [ ! -d "$REPO_DIR/.git" ]; then
   fi
 fi
 
-echo "prepared playbook=${PLAYBOOK} profile=${PROFILE} threat=${THREAT} repo=${GITHUB_OWNER}/${GITHUB_NAME} dest=s3://${ARTIFACTS_BUCKET}/${ARTIFACTS_PREFIX}${RUN_ID}/report.md"
+echo "prepared playbook=${PLAYBOOK} inference=${INFERENCE} profile=${PROFILE} threat=${THREAT} repo=${GITHUB_OWNER}/${GITHUB_NAME} dest=s3://${ARTIFACTS_BUCKET}/${ARTIFACTS_PREFIX}${RUN_ID}/report.md"
 """
 
 
@@ -643,7 +648,7 @@ def prepare_script(slug: str) -> str:
 
 
 def build_scan_graph(slug: str, *, description: str):
-    """Build the prepare → Kimi review → S3 publish graph for a Scan playbook."""
+    """Build the prepare → agent review → artifact publish graph."""
     from agentflow import Graph, kimi, shell
 
     profile = scan_profile()
@@ -728,8 +733,7 @@ def clone_instructions(slug: str) -> str:
 def goal_workspace_preamble(slug: str) -> str:
     dest = artifact_uri()
     return (
-        "You are Midkernel Scan running as the Kimi CLI harness on OpenRouter only "
-        "(not Bedrock, not AI Gateway). OpenCode is not part of this path.\n\n"
+        "You are Midkernel Scan running through the configured AgentFlow inference harness.\n\n"
         "Workspace:\n"
         f"{clone_instructions(slug)}\n"
         f"- Shared handoff is files under the cloned repo ({repo_dir()} when local). "
