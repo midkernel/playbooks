@@ -513,6 +513,28 @@ def test_official_probe_uses_selected_binary_without_node_io(
     assert not (tmp_path / "missing").exists()
 
 
+def test_official_agent_child_receives_only_allowlisted_runtime_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured = tmp_path / "child-env"
+    fake = tmp_path / "codex"
+    fake.write_text(f"#!/bin/sh\nenv > '{captured}'\n", encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setenv("MIDKERNEL_ADMIN_INFERENCE", "codex")
+    monkeypatch.setenv("MIDKERNEL_CODEX_BIN", str(fake))
+    monkeypatch.setenv("MIDKERNEL_NODE_IO", "0")
+    monkeypatch.setenv("GITHUB_TOKEN", "github-secret")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "aws-secret")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-secret")
+    monkeypatch.setenv("FINISH_TOKEN", "finish-secret")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+    assert io.main(["exec", "review this fixture"]) == 0
+    text = captured.read_text(encoding="utf-8")
+    for secret in ("github-secret", "aws-secret", "openrouter-secret", "finish-secret"):
+        assert secret not in text
+    assert "GIT_CONFIG_GLOBAL=/dev/null" in text
+
+
 def test_version_succeeds_without_real_kimi_bin(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -615,6 +637,18 @@ def test_kimi_io_env_preserves_explicitly_disabled_node_reporting(monkeypatch: p
     monkeypatch.setenv("MIDKERNEL_NODE_IO", "0")
     env = io.kimi_io_env("threat-model", outputs=["THREAT_MODEL.md"])
     assert env["MIDKERNEL_NODE_IO"] == "0"
+
+
+def test_official_node_env_does_not_serialize_openrouter_or_cloud_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MIDKERNEL_ADMIN_INFERENCE", "codex")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-secret")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "aws-secret")
+    monkeypatch.setenv("GITHUB_TOKEN", "github-secret")
+    env = io.kimi_io_env("threat-model", outputs=["THREAT_MODEL.md"])
+    assert "OPENROUTER_API_KEY" not in env
+    assert "OPENAI_API_KEY" not in env
+    assert "AWS_SECRET_ACCESS_KEY" not in env
+    assert "GITHUB_TOKEN" not in env
 
 
 def test_kimi_io_env_passes_openrouter_keys(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

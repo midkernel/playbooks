@@ -186,6 +186,9 @@ def test_local_daybreak_nodes_use_official_codex_model_and_ultra() -> None:
             "MIDKERNEL_ADMIN_INFERENCE": "codex",
             "MIDKERNEL_ADMIN_MODEL": "gpt-daybreak-blue-latest",
             "MIDKERNEL_ADMIN_EFFORT": "ultra",
+            "OPENROUTER_API_KEY": "must-not-be-emitted",
+            "AWS_SECRET_ACCESS_KEY": "must-not-be-emitted",
+            "GITHUB_TOKEN": "must-not-be-emitted",
         },
     )
     nodes = {node["id"]: node for node in spec["nodes"]}
@@ -201,6 +204,9 @@ def test_local_daybreak_nodes_use_official_codex_model_and_ultra() -> None:
         assert node["executable"].endswith("_node_io.py")
         assert "provider" not in node
         assert "OPENROUTER_API_KEY" not in node["env"]
+        assert "OPENAI_API_KEY" not in node["env"]
+        assert "AWS_SECRET_ACCESS_KEY" not in node["env"]
+        assert "GITHUB_TOKEN" not in node["env"]
 
 
 @pytest.mark.parametrize(

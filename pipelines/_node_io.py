@@ -1537,9 +1537,28 @@ def graph_runtime_env() -> dict[str, str]:
     return env
 
 
+def official_graph_runtime_env() -> dict[str, str]:
+    """Node metadata for official agents without serializing provider secrets."""
+    shim = str(kimi_shim_dir())
+    path = os.environ.get("PATH", "")
+    parts = [part for part in path.split(os.pathsep) if part and part != shim]
+    env = {
+        "BASH_ENV": "/dev/null",
+        "MIDKERNEL_NODE_READY": "1",
+        "MIDKERNEL_NODE_IO": env_first("MIDKERNEL_NODE_IO") or "1",
+        "PATH": os.pathsep.join(parts),
+        "WORKDIR": workdir(),
+    }
+    for name in ("RUN_ID", "OUTPUTS_DIR", "MIDKERNEL_REPORT_TRANSPORT"):
+        value = env_first(name)
+        if value:
+            env[name] = value
+    return env
+
+
 def shell_io_env(node_id: str) -> dict[str, str]:
     """Env for prepare/publish so ``bash -c`` does not source node-env.sh."""
-    env = graph_runtime_env()
+    env = graph_runtime_env() if configured_inference() == "kimi" else official_graph_runtime_env()
     env["MIDKERNEL_NODE_ID"] = safe_node_id(node_id)
     env["MIDKERNEL_NODE_KIND"] = "shell"
     return env
@@ -1683,8 +1702,10 @@ def kimi_io_env(
     dynamic: bool | None = None,
 ) -> dict[str, str]:
     nid = safe_node_id(node_id)
-    env = graph_runtime_env()
-    env.update(openrouter_passthrough_env(model=model))
+    inference = configured_inference()
+    env = graph_runtime_env() if inference == "kimi" else official_graph_runtime_env()
+    if inference == "kimi":
+        env.update(openrouter_passthrough_env(model=model))
     env.update(
         {
             "MIDKERNEL_NODE_ID": nid,
@@ -1800,7 +1821,7 @@ def _official_prompt(argv: list[str], inference: str) -> str:
 def _forward_official_probe(argv: list[str], inference: str) -> int:
     binary = official_agent_bin(inference)
     try:
-        return int(subprocess.run([binary, *argv], check=False).returncode)
+        return int(subprocess.run([binary, *argv], check=False, env=official_child_env(inference)).returncode)
     except OSError as exc:
         print(f"node io: {inference} probe failed ({binary}): {exc}", file=sys.stderr)
         return 1
@@ -1808,6 +1829,22 @@ def _forward_official_probe(argv: list[str], inference: str) -> int:
 
 HUNTER_INNER_TIMEOUT_RATIO = 0.9
 INCOMPLETE_HUNTER_MARKER = "This is **not** a security finding."
+
+OFFICIAL_CHILD_ENV_NAMES = (
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE",
+    "TERM", "TMPDIR", "TZ", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME",
+    "XDG_RUNTIME_DIR", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy",
+    "no_proxy", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_EFFORT_LEVEL",
+    "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_TERMINAL_PROMPT",
+)
+
+
+def official_child_env(inference: str) -> dict[str, str]:
+    """Runtime allowlist for an official agent inspecting an untrusted repo."""
+    if inference not in {"codex", "claude"}:
+        raise ValueError(f"unsupported official inference: {inference}")
+    return {name: os.environ[name] for name in OFFICIAL_CHILD_ENV_NAMES if name in os.environ}
 
 
 def hunter_continue_enabled(node_id: str | None = None) -> bool:
@@ -1916,7 +1953,9 @@ def wrap_official_agent(argv: list[str], inference: str | None = None) -> int:
     error = None
     inner_timeout = hunter_inner_timeout_seconds() if hunter_continue_enabled(node_id) else None
     try:
-        result = subprocess.run([binary, *argv], check=False, timeout=inner_timeout)
+        result = subprocess.run(
+            [binary, *argv], check=False, env=official_child_env(selected), timeout=inner_timeout
+        )
         code = int(result.returncode)
     except subprocess.TimeoutExpired:
         code = 124

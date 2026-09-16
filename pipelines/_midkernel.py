@@ -412,17 +412,16 @@ def review_prompt(slug: str) -> str:
             f"- Default clone for this playbook is the private hunt mirror "
             f"github.com/{target.repo} at ref `{target.ref}` "
             f"(overridable via GITHUB_OWNER, GITHUB_NAME, GITHUB_REF). "
-            f"If the tree is not already at {repo_dir()}, clone it with GITHUB_TOKEN "
-            "(https://x-access-token:<token>@github.com/<owner>/<name>.git). "
+            f"The trusted runner should preclone it at {repo_dir()}; if absent, "
+            "prepare may attempt a tokenless public HTTPS clone. "
             "Shallow clone only — do not recurse submodules "
             "(Firedancer `agave/` is out of scope unless the crash stack lands there)."
         )
     else:
         clone_line = (
-            f"- Clone of github.com/${{GITHUB_OWNER}}/${{GITHUB_NAME}} if already present "
-            f"at {repo_dir()}, otherwise clone it with GITHUB_TOKEN "
-            "(https://x-access-token:<token>@github.com/<owner>/<name>.git), "
-            "optional GITHUB_REF as --branch. This playbook has no default target."
+            f"- The trusted runner preclones github.com/${{GITHUB_OWNER}}/${{GITHUB_NAME}} "
+            f"at {repo_dir()}. Prepare may attempt a tokenless public HTTPS clone if absent; "
+            "GITHUB_REF selects the branch. This playbook has no default target."
         )
     return (
         f"{skill}\n\n"
@@ -549,7 +548,7 @@ if inference == "kimi" and not os.environ.get("OPENROUTER_API_KEY", "").strip() 
             os.path.join(workdir, ".midkernel-openrouter"),
         ):
             print(value, file=open(dest, "w"))
-if not os.environ.get("GITHUB_TOKEN", "").strip() and os.environ.get("MIDKERNEL_LOCAL") != "1":
+if inference == "kimi" and not os.environ.get("GITHUB_TOKEN", "").strip() and os.environ.get("MIDKERNEL_LOCAL") != "1":
     value = load_secret(gh_secret_id, region)
     if value:
         print(value, file=open(os.environ["HOME"] + "/.midkernel-github", "w"))
@@ -563,7 +562,7 @@ if [ "$INFERENCE" = "kimi" ] && [ -z "${OPENROUTER_API_KEY:-}" ] && [ -f "$HOME/
   OPENROUTER_API_KEY="$(tr -d '\n' < "$HOME/.midkernel-openrouter")"
   export OPENROUTER_API_KEY
 fi
-if [ -z "${GITHUB_TOKEN:-}" ] && [ -f "$HOME/.midkernel-github" ]; then
+if [ "$INFERENCE" = "kimi" ] && [ -z "${GITHUB_TOKEN:-}" ] && [ -f "$HOME/.midkernel-github" ]; then
   GITHUB_TOKEN="$(tr -d '\n' < "$HOME/.midkernel-github")"
   export GITHUB_TOKEN
 fi
@@ -609,17 +608,21 @@ EOF
 fi
 
 if [ ! -d "$REPO_DIR/.git" ]; then
+  CLONE_URL="https://github.com/${GITHUB_OWNER}/${GITHUB_NAME}.git"
+  GIT_AUTH_OPTION=""
   if [ -n "${GITHUB_TOKEN:-}" ]; then
-    CLONE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_OWNER}/${GITHUB_NAME}.git"
-  else
-    CLONE_URL="https://github.com/${GITHUB_OWNER}/${GITHUB_NAME}.git"
+    MIDKERNEL_GIT_AUTHORIZATION="Authorization: Basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
+    export MIDKERNEL_GIT_AUTHORIZATION
+    GIT_AUTH_OPTION="--config-env=http.https://github.com/.extraHeader=MIDKERNEL_GIT_AUTHORIZATION"
   fi
   rm -rf "$REPO_DIR"
   if [ -n "${GITHUB_REF:-}" ]; then
-    git clone --depth 1 --no-recurse-submodules --branch "$GITHUB_REF" "$CLONE_URL" "$REPO_DIR"
+    git ${GIT_AUTH_OPTION:+"$GIT_AUTH_OPTION"} clone --depth 1 --no-recurse-submodules --branch "$GITHUB_REF" "$CLONE_URL" "$REPO_DIR"
   else
-    git clone --depth 1 --no-recurse-submodules "$CLONE_URL" "$REPO_DIR"
+    git ${GIT_AUTH_OPTION:+"$GIT_AUTH_OPTION"} clone --depth 1 --no-recurse-submodules "$CLONE_URL" "$REPO_DIR"
   fi
+  git -C "$REPO_DIR" remote set-url origin "$CLONE_URL"
+  unset MIDKERNEL_GIT_AUTHORIZATION GIT_AUTH_OPTION
 fi
 
 echo "prepared playbook=${PLAYBOOK} inference=${INFERENCE} profile=${PROFILE} threat=${THREAT} repo=${GITHUB_OWNER}/${GITHUB_NAME} dest=s3://${ARTIFACTS_BUCKET}/${ARTIFACTS_PREFIX}${RUN_ID}/report.md"
