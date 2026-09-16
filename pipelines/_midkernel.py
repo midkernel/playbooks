@@ -20,6 +20,7 @@ try:
         UNSAFE_OPENROUTER_MAX_TOKENS,
         bootstrap_run_io,
         clamp_kimi_max_tokens,
+        configured_inference,
         kimi_config_file,
         kimi_executable,
         kimi_io_env,
@@ -37,6 +38,7 @@ except ImportError:  # ``python3 pipelines/<slug>.py`` puts this dir on sys.path
         UNSAFE_OPENROUTER_MAX_TOKENS,
         bootstrap_run_io,
         clamp_kimi_max_tokens,
+        configured_inference,
         kimi_config_file,
         kimi_executable,
         kimi_io_env,
@@ -649,7 +651,7 @@ def prepare_script(slug: str) -> str:
 
 def build_scan_graph(slug: str, *, description: str):
     """Build the prepare → agent review → artifact publish graph."""
-    from agentflow import Graph, kimi, shell
+    from agentflow import Graph, shell
 
     profile = scan_profile()
     model = openrouter_model()
@@ -671,18 +673,13 @@ def build_scan_graph(slug: str, *, description: str):
             timeout_seconds=10 * 60,
             target=node_target(),
         )
-        review = kimi(
+        review = _kimi_scan_node(
             task_id="review",
             prompt=prompt,
             model=model,
-            tools="read_write",
-            provider=openrouter_provider(),
-            env={**openrouter_node_env(model=model), **kimi_io_env("review", outputs=[REPORT_NAME], model=model)},
-            executable=kimi_executable(),
-            extra_args=kimi_extra_args(model),
             timeout_seconds=timeout,
-            retries=0,
-            target=node_target(cwd=review_cwd),
+            cwd=review_cwd,
+            outputs=[REPORT_NAME],
             success_criteria=[
                 {"kind": "file_exists", "path": REPORT_NAME},
                 {"kind": "file_nonempty", "path": REPORT_NAME},
@@ -695,7 +692,7 @@ def build_scan_graph(slug: str, *, description: str):
             timeout_seconds=5 * 60,
             target=node_target(cwd=review_cwd),
             success_criteria=[
-                {"kind": "output_contains", "value": "uploaded s3://"},
+                {"kind": "output_contains", "value": "report publication verified"},
             ],
         )
         prepare >> review >> publish
@@ -768,10 +765,15 @@ def _kimi_scan_node(
     parent_id: str | None = None,
     dynamic: bool | None = None,
 ):
-    from agentflow import kimi
+    from agentflow import claude, codex, kimi
 
+    inference = configured_inference()
     slug = model or openrouter_model()
-    env = openrouter_node_env(model=slug)
+    if inference == "codex":
+        slug = env_first("MIDKERNEL_ADMIN_MODEL", default="gpt-daybreak-blue-latest")
+    elif inference == "claude":
+        slug = env_first("MIDKERNEL_ADMIN_MODEL", default="claude-opus-5")
+    env = openrouter_node_env(model=slug) if inference == "kimi" else {}
     env.update(
         kimi_io_env(
             task_id,
@@ -786,20 +788,34 @@ def _kimi_scan_node(
         "prompt": prompt,
         "model": slug,
         "tools": "read_write",
-        "provider": openrouter_provider(),
         "env": env,
         "executable": kimi_executable(),
-        "extra_args": kimi_extra_args(slug),
         "timeout_seconds": timeout_seconds if timeout_seconds is not None else hard_timeout_seconds(),
         "retries": 0,
         "target": node_target(cwd=cwd),
     }
     if success_criteria:
         kwargs["success_criteria"] = success_criteria
+    factory = kimi
+    if inference == "kimi":
+        kwargs["provider"] = openrouter_provider()
+        kwargs["extra_args"] = kimi_extra_args(slug)
+    elif inference == "codex":
+        factory = codex
+        effort = env_first("MIDKERNEL_ADMIN_EFFORT", default="ultra")
+        kwargs["extra_args"] = ["-c", f'model_reasoning_effort="{effort}"']
+        env["MIDKERNEL_EFFECTIVE_MODEL"] = slug
+    elif inference == "claude":
+        factory = claude
+        effort = env_first("MIDKERNEL_ADMIN_EFFORT", default="max")
+        kwargs["extra_args"] = ["--effort", effort]
+        env["MIDKERNEL_EFFECTIVE_MODEL"] = slug
+    else:
+        raise ValueError(f"unsupported MIDKERNEL_ADMIN_INFERENCE={inference!r}")
     if task_id.startswith("hunter-"):
         env["MIDKERNEL_HUNTER_CONTINUE"] = "1"
         env["MIDKERNEL_NODE_TIMEOUT_SECONDS"] = str(kwargs["timeout_seconds"])
-    return kimi(**kwargs)
+    return factory(**kwargs)
 
 
 def _goal_skill(slug: str) -> str:
@@ -1179,7 +1195,7 @@ def build_goal_scan_graph(slug: str, *, description: str):
             timeout_seconds=5 * 60,
             target=node_target(cwd=cwd),
             success_criteria=[
-                {"kind": "output_contains", "value": "uploaded s3://"},
+                {"kind": "output_contains", "value": "report publication verified"},
             ],
         )
         prepare >> threat >> author >> split
@@ -1226,11 +1242,12 @@ if [ -z "$REPORT" ]; then
   exit 1
 fi
 
-python3 - "$REPORT" "$ARTIFACTS_BUCKET" "$KEY" "$AWS_REGION" <<'PY'
+python3 - "$REPORT" "$ARTIFACTS_BUCKET" "$KEY" "$AWS_REGION" "${MIDKERNEL_REPORT_TRANSPORT:-s3}" <<'PY'
 import pathlib, sys
 
 path = pathlib.Path(sys.argv[1])
 bucket, key, region = sys.argv[2], sys.argv[3], sys.argv[4]
+transport = sys.argv[5].strip().lower()
 text = path.read_text(encoding="utf-8", errors="replace")
 lower = text.lower()
 if len(text.strip()) < 80:
@@ -1246,6 +1263,15 @@ forbidden = (
 if any(token in lower for token in forbidden):
     raise SystemExit("report.md looks like a stub; refusing upload")
 
+# A devbox queue worker sends this exact validated Markdown to the app's
+# per-Run finish endpoint. The app performs its own immutable S3 write and
+# byte-for-byte readback before marking the Run complete.
+if transport == "http":
+    print(f"report publication verified: local report ready for HTTP finish ({len(text.encode('utf-8'))} bytes)")
+    raise SystemExit(0)
+if transport != "s3":
+    raise SystemExit(f"unsupported MIDKERNEL_REPORT_TRANSPORT={transport!r}")
+
 try:
     import boto3
 except ImportError as exc:
@@ -1257,6 +1283,6 @@ boto3.client("s3", region_name=region).put_object(
     Body=text.encode("utf-8"),
     ContentType="text/markdown; charset=utf-8",
 )
-print(f"uploaded s3://{bucket}/{key} ({len(text.encode('utf-8'))} bytes)")
+print(f"report publication verified: uploaded s3://{bucket}/{key} ({len(text.encode('utf-8'))} bytes)")
 PY
 """

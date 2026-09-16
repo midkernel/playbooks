@@ -116,6 +116,7 @@ Coordinate names with `midkernel/app` (`src/lib/agentflow-contract.ts`) and `mid
 | `GITHUB_TOKEN` | same | yes* | Installation token; else SM `midkernel/dev/harness/github-token` |
 | `OPENROUTER_API_KEY` | same | yes* | Else SM `midkernel/dev/harness/openrouter-api-key` |
 | `MIDKERNEL_AGENTFLOW_TARGET` | same | no | `ecs` (default published graph) or `local` (in-task). **Must be `local` on the single ECS task** |
+| `MIDKERNEL_REPORT_TRANSPORT` | devbox queue | no | `s3` by default. Set `http` only when the devbox worker posts the validated final Markdown to the app Run finish endpoint, which stores and reads it back before completion. |
 | `MIDKERNEL_NODE_IO` | same | no | `1` on ECS (prepare/runtime). `0` keeps emit/CI side-effect free |
 | `WORKDIR` | same | no | Shared task disk. Image default `/workspace`. Must exist + be writable when I/O runs |
 | `MIDKERNEL_KIMI_BIN` | same | no | Real kimi-cli. Default `/opt/midkernel/kimi.bin` on the runner image. Do **not** use PATH `kimi` (that wrapper requires `report.md` after every node) |

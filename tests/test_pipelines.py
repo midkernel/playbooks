@@ -91,6 +91,9 @@ def _load(slug: str, env: dict[str, str] | None = None) -> dict:
         "CONCURRENCY",
         "GRAPH_CONCURRENCY",
         "GOAL_COUNT",
+        "MIDKERNEL_ADMIN_INFERENCE",
+        "MIDKERNEL_ADMIN_MODEL",
+        "MIDKERNEL_ADMIN_EFFORT",
     ):
         if not env or name not in env:
             merged.pop(name, None)
@@ -173,6 +176,27 @@ def test_local_in_task_override() -> None:
     review = next(node for node in spec["nodes"] if node["id"] == "review")
     assert review["target"]["kind"] == "local"
     assert review["target"]["cwd"].endswith("/repo")
+
+
+def test_local_daybreak_nodes_use_official_codex_model_and_ultra() -> None:
+    spec = _load(
+        GOAL_SLUG,
+        env={
+            "MIDKERNEL_AGENTFLOW_TARGET": "local",
+            "MIDKERNEL_ADMIN_INFERENCE": "codex",
+            "MIDKERNEL_ADMIN_MODEL": "gpt-daybreak-blue-latest",
+            "MIDKERNEL_ADMIN_EFFORT": "ultra",
+        },
+    )
+    nodes = {node["id"]: node for node in spec["nodes"]}
+    agents = [node for node in nodes.values() if node["agent"] == "codex"]
+    assert agents
+    for node in agents:
+        assert node["model"] == "gpt-daybreak-blue-latest"
+        assert node["extra_args"] == ["-c", 'model_reasoning_effort="ultra"']
+        assert node["executable"].endswith("_node_io.py")
+        assert "provider" not in node
+        assert "OPENROUTER_API_KEY" not in node["env"]
 
 
 @pytest.mark.parametrize(

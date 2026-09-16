@@ -677,3 +677,27 @@ def test_emit_goal_is_side_effect_free_without_run(
     assert not (tmp_path / ".midkernel").exists()
     payload = json.loads(capsys.readouterr().out)
     assert payload["name"] == "goal-security-review"
+
+
+def test_publish_http_transport_validates_without_s3(tmp_path: Path) -> None:
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    (outputs / "report.md").write_text(
+        "# Security review\n\n" + "Evidence-backed review result. " * 8,
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        ["bash", "-c", mk.PUBLISH_SCRIPT],
+        env={
+            **os.environ,
+            "RUN_ID": "run-http",
+            "WORKDIR": str(tmp_path / "work"),
+            "OUTPUTS_DIR": str(outputs),
+            "MIDKERNEL_REPORT_TRANSPORT": "http",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "report publication verified: local report ready for HTTP finish" in result.stdout
