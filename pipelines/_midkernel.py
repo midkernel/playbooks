@@ -20,6 +20,7 @@ try:
         UNSAFE_OPENROUTER_MAX_TOKENS,
         bootstrap_run_io,
         clamp_kimi_max_tokens,
+        configured_inference,
         kimi_config_file,
         kimi_executable,
         kimi_io_env,
@@ -37,6 +38,7 @@ except ImportError:  # ``python3 pipelines/<slug>.py`` puts this dir on sys.path
         UNSAFE_OPENROUTER_MAX_TOKENS,
         bootstrap_run_io,
         clamp_kimi_max_tokens,
+        configured_inference,
         kimi_config_file,
         kimi_executable,
         kimi_io_env,
@@ -410,22 +412,20 @@ def review_prompt(slug: str) -> str:
             f"- Default clone for this playbook is the private hunt mirror "
             f"github.com/{target.repo} at ref `{target.ref}` "
             f"(overridable via GITHUB_OWNER, GITHUB_NAME, GITHUB_REF). "
-            f"If the tree is not already at {repo_dir()}, clone it with GITHUB_TOKEN "
-            "(https://x-access-token:<token>@github.com/<owner>/<name>.git). "
+            f"The trusted runner should preclone it at {repo_dir()}; if absent, "
+            "prepare may attempt a tokenless public HTTPS clone. "
             "Shallow clone only — do not recurse submodules "
             "(Firedancer `agave/` is out of scope unless the crash stack lands there)."
         )
     else:
         clone_line = (
-            f"- Clone of github.com/${{GITHUB_OWNER}}/${{GITHUB_NAME}} if already present "
-            f"at {repo_dir()}, otherwise clone it with GITHUB_TOKEN "
-            "(https://x-access-token:<token>@github.com/<owner>/<name>.git), "
-            "optional GITHUB_REF as --branch. This playbook has no default target."
+            f"- The trusted runner preclones github.com/${{GITHUB_OWNER}}/${{GITHUB_NAME}} "
+            f"at {repo_dir()}. Prepare may attempt a tokenless public HTTPS clone if absent; "
+            "GITHUB_REF selects the branch. This playbook has no default target."
         )
     return (
         f"{skill}\n\n"
-        "You are Midkernel Scan running as the Kimi CLI harness on OpenRouter only "
-        "(not Bedrock, not AI Gateway). OpenCode is not part of this path.\n\n"
+        "You are Midkernel Scan running through the configured AgentFlow inference harness.\n\n"
         "Workspace:\n"
         f"{clone_line}\n"
         f"- Read RUN_ID, PLAYBOOK/PLAYBOOK_SLUG, PROFILE/SCAN_PROFILE, "
@@ -464,6 +464,11 @@ KIMI_MAX_TOKENS="${MIDKERNEL_OPENROUTER_MAX_TOKENS:-${OPENROUTER_MAX_TOKENS:-${K
 OPENROUTER_SECRET_ID="${OPENROUTER_SECRET_ID:-midkernel/dev/harness/openrouter-api-key}"
 GITHUB_TOKEN_SECRET_ID="${GITHUB_TOKEN_SECRET_ID:-midkernel/dev/harness/github-token}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
+INFERENCE="${MIDKERNEL_ADMIN_INFERENCE:-${MIDKERNEL_INFERENCE:-kimi}}"
+case "$INFERENCE" in
+  codex_subscription) INFERENCE=codex ;;
+  claude_subscription) INFERENCE=claude ;;
+esac
 __DEFAULT_CLONE__
 : "${RUN_ID:?RUN_ID is required}"
 : "${GITHUB_OWNER:?GITHUB_OWNER is required (no default target for this playbook)}"
@@ -500,7 +505,7 @@ if [ -x /opt/midkernel/kimi.bin ]; then
 fi
 echo "node io: prepare WORKDIR=$WORKDIR RUN_ID=${RUN_ID:-unset} MIDKERNEL_NODE_IO=$MIDKERNEL_NODE_IO MIDKERNEL_AGENTFLOW_TARGET=${MIDKERNEL_AGENTFLOW_TARGET:-} MIDKERNEL_KIMI_BIN=${MIDKERNEL_KIMI_BIN:-unset}" >&2
 
-python3 - "$OPENROUTER_SECRET_ID" "$GITHUB_TOKEN_SECRET_ID" "$AWS_REGION" <<'PY'
+python3 - "$OPENROUTER_SECRET_ID" "$GITHUB_TOKEN_SECRET_ID" "$AWS_REGION" "$INFERENCE" <<'PY'
 import json, os, sys
 
 def load_secret(secret_id: str, region: str) -> str:
@@ -533,9 +538,9 @@ def load_secret(secret_id: str, region: str) -> str:
         return ""
     return raw
 
-secret_id, gh_secret_id, region = sys.argv[1], sys.argv[2], sys.argv[3]
+secret_id, gh_secret_id, region, inference = sys.argv[1:5]
 workdir = os.environ.get("WORKDIR", "/workspace")
-if not os.environ.get("OPENROUTER_API_KEY", "").strip() and os.environ.get("MIDKERNEL_LOCAL") != "1":
+if inference == "kimi" and not os.environ.get("OPENROUTER_API_KEY", "").strip() and os.environ.get("MIDKERNEL_LOCAL") != "1":
     value = load_secret(secret_id, region)
     if value:
         for dest in (
@@ -543,44 +548,44 @@ if not os.environ.get("OPENROUTER_API_KEY", "").strip() and os.environ.get("MIDK
             os.path.join(workdir, ".midkernel-openrouter"),
         ):
             print(value, file=open(dest, "w"))
-if not os.environ.get("GITHUB_TOKEN", "").strip() and os.environ.get("MIDKERNEL_LOCAL") != "1":
+if inference == "kimi" and not os.environ.get("GITHUB_TOKEN", "").strip() and os.environ.get("MIDKERNEL_LOCAL") != "1":
     value = load_secret(gh_secret_id, region)
     if value:
         print(value, file=open(os.environ["HOME"] + "/.midkernel-github", "w"))
 PY
 
-if [ -z "${OPENROUTER_API_KEY:-}" ] && [ -f "$WORKDIR/.midkernel-openrouter" ]; then
+if [ "$INFERENCE" = "kimi" ] && [ -z "${OPENROUTER_API_KEY:-}" ] && [ -f "$WORKDIR/.midkernel-openrouter" ]; then
   OPENROUTER_API_KEY="$(tr -d '\n' < "$WORKDIR/.midkernel-openrouter")"
   export OPENROUTER_API_KEY
 fi
-if [ -z "${OPENROUTER_API_KEY:-}" ] && [ -f "$HOME/.midkernel-openrouter" ]; then
+if [ "$INFERENCE" = "kimi" ] && [ -z "${OPENROUTER_API_KEY:-}" ] && [ -f "$HOME/.midkernel-openrouter" ]; then
   OPENROUTER_API_KEY="$(tr -d '\n' < "$HOME/.midkernel-openrouter")"
   export OPENROUTER_API_KEY
 fi
-if [ -z "${GITHUB_TOKEN:-}" ] && [ -f "$HOME/.midkernel-github" ]; then
+if [ "$INFERENCE" = "kimi" ] && [ -z "${GITHUB_TOKEN:-}" ] && [ -f "$HOME/.midkernel-github" ]; then
   GITHUB_TOKEN="$(tr -d '\n' < "$HOME/.midkernel-github")"
   export GITHUB_TOKEN
 fi
 
-if [ -z "${OPENROUTER_API_KEY:-}" ]; then
-  echo "OPENROUTER_API_KEY is missing (set env or Secrets Manager midkernel/dev/harness/openrouter-api-key)" >&2
-  exit 2
-fi
-export OPENAI_API_KEY="$OPENROUTER_API_KEY"
-export KIMI_API_KEY="$OPENROUTER_API_KEY"
-export OPENAI_BASE_URL="https://openrouter.ai/api/v1"
+if [ "$INFERENCE" = "kimi" ]; then
+  if [ -z "${OPENROUTER_API_KEY:-}" ]; then
+    echo "OPENROUTER_API_KEY is missing (set env or Secrets Manager midkernel/dev/harness/openrouter-api-key)" >&2
+    exit 2
+  fi
+  export OPENAI_API_KEY="$OPENROUTER_API_KEY"
+  export KIMI_API_KEY="$OPENROUTER_API_KEY"
+  export OPENAI_BASE_URL="https://openrouter.ai/api/v1"
 
-# Persist key + config on the shared task disk. Later Kimi nodes run with
-# cwd=$WORKDIR/repo and BASH_ENV=/dev/null (runner prepare_node skipped),
-# so $HOME/.kimi/config.toml alone is not enough.
-printf '%s' "$OPENROUTER_API_KEY" > "$WORKDIR/.midkernel-openrouter"
-chmod 600 "$WORKDIR/.midkernel-openrouter" || true
-if [ -n "${HOME:-}" ]; then
-  printf '%s' "$OPENROUTER_API_KEY" > "$HOME/.midkernel-openrouter"
-  chmod 600 "$HOME/.midkernel-openrouter" || true
-fi
+  # Persist key + config on the shared task disk. Later Kimi nodes run with
+  # cwd=$WORKDIR/repo and BASH_ENV=/dev/null (runner prepare_node skipped).
+  printf '%s' "$OPENROUTER_API_KEY" > "$WORKDIR/.midkernel-openrouter"
+  chmod 600 "$WORKDIR/.midkernel-openrouter" || true
+  if [ -n "${HOME:-}" ]; then
+    printf '%s' "$OPENROUTER_API_KEY" > "$HOME/.midkernel-openrouter"
+    chmod 600 "$HOME/.midkernel-openrouter" || true
+  fi
 
-cat > "$KIMI_SHARE_DIR/config.toml" <<EOF
+  cat > "$KIMI_SHARE_DIR/config.toml" <<EOF
 default_model = "midkernel"
 default_thinking = false
 default_yolo = true
@@ -597,25 +602,30 @@ max_context_size = 262144
 max_tokens = ${KIMI_MAX_TOKENS}
 max_output_size = ${KIMI_MAX_TOKENS}
 EOF
-chmod 600 "$KIMI_SHARE_DIR/config.toml" || true
-cp "$KIMI_SHARE_DIR/config.toml" "$HOME/.kimi/config.toml"
-chmod 600 "$HOME/.kimi/config.toml" || true
-
-if [ ! -d "$REPO_DIR/.git" ]; then
-  if [ -z "${GITHUB_TOKEN:-}" ]; then
-    echo "GITHUB_TOKEN is missing (set env or Secrets Manager midkernel/dev/harness/github-token)" >&2
-    exit 2
-  fi
-  CLONE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_OWNER}/${GITHUB_NAME}.git"
-  rm -rf "$REPO_DIR"
-  if [ -n "${GITHUB_REF:-}" ]; then
-    git clone --depth 1 --no-recurse-submodules --branch "$GITHUB_REF" "$CLONE_URL" "$REPO_DIR"
-  else
-    git clone --depth 1 --no-recurse-submodules "$CLONE_URL" "$REPO_DIR"
-  fi
+  chmod 600 "$KIMI_SHARE_DIR/config.toml" || true
+  cp "$KIMI_SHARE_DIR/config.toml" "$HOME/.kimi/config.toml"
+  chmod 600 "$HOME/.kimi/config.toml" || true
 fi
 
-echo "prepared playbook=${PLAYBOOK} profile=${PROFILE} threat=${THREAT} repo=${GITHUB_OWNER}/${GITHUB_NAME} dest=s3://${ARTIFACTS_BUCKET}/${ARTIFACTS_PREFIX}${RUN_ID}/report.md"
+if [ ! -d "$REPO_DIR/.git" ]; then
+  CLONE_URL="https://github.com/${GITHUB_OWNER}/${GITHUB_NAME}.git"
+  GIT_AUTH_OPTION=""
+  if [ -n "${GITHUB_TOKEN:-}" ]; then
+    MIDKERNEL_GIT_AUTHORIZATION="Authorization: Basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
+    export MIDKERNEL_GIT_AUTHORIZATION
+    GIT_AUTH_OPTION="--config-env=http.https://github.com/.extraHeader=MIDKERNEL_GIT_AUTHORIZATION"
+  fi
+  rm -rf "$REPO_DIR"
+  if [ -n "${GITHUB_REF:-}" ]; then
+    git ${GIT_AUTH_OPTION:+"$GIT_AUTH_OPTION"} clone --depth 1 --no-recurse-submodules --branch "$GITHUB_REF" "$CLONE_URL" "$REPO_DIR"
+  else
+    git ${GIT_AUTH_OPTION:+"$GIT_AUTH_OPTION"} clone --depth 1 --no-recurse-submodules "$CLONE_URL" "$REPO_DIR"
+  fi
+  git -C "$REPO_DIR" remote set-url origin "$CLONE_URL"
+  unset MIDKERNEL_GIT_AUTHORIZATION GIT_AUTH_OPTION
+fi
+
+echo "prepared playbook=${PLAYBOOK} inference=${INFERENCE} profile=${PROFILE} threat=${THREAT} repo=${GITHUB_OWNER}/${GITHUB_NAME} dest=s3://${ARTIFACTS_BUCKET}/${ARTIFACTS_PREFIX}${RUN_ID}/report.md"
 """
 
 
@@ -643,8 +653,8 @@ def prepare_script(slug: str) -> str:
 
 
 def build_scan_graph(slug: str, *, description: str):
-    """Build the prepare → Kimi review → S3 publish graph for a Scan playbook."""
-    from agentflow import Graph, kimi, shell
+    """Build the prepare → agent review → artifact publish graph."""
+    from agentflow import Graph, shell
 
     profile = scan_profile()
     model = openrouter_model()
@@ -666,18 +676,13 @@ def build_scan_graph(slug: str, *, description: str):
             timeout_seconds=10 * 60,
             target=node_target(),
         )
-        review = kimi(
+        review = _kimi_scan_node(
             task_id="review",
             prompt=prompt,
             model=model,
-            tools="read_write",
-            provider=openrouter_provider(),
-            env={**openrouter_node_env(model=model), **kimi_io_env("review", outputs=[REPORT_NAME], model=model)},
-            executable=kimi_executable(),
-            extra_args=kimi_extra_args(model),
             timeout_seconds=timeout,
-            retries=0,
-            target=node_target(cwd=review_cwd),
+            cwd=review_cwd,
+            outputs=[REPORT_NAME],
             success_criteria=[
                 {"kind": "file_exists", "path": REPORT_NAME},
                 {"kind": "file_nonempty", "path": REPORT_NAME},
@@ -690,7 +695,7 @@ def build_scan_graph(slug: str, *, description: str):
             timeout_seconds=5 * 60,
             target=node_target(cwd=review_cwd),
             success_criteria=[
-                {"kind": "output_contains", "value": "uploaded s3://"},
+                {"kind": "output_contains", "value": "report publication verified"},
             ],
         )
         prepare >> review >> publish
@@ -728,8 +733,7 @@ def clone_instructions(slug: str) -> str:
 def goal_workspace_preamble(slug: str) -> str:
     dest = artifact_uri()
     return (
-        "You are Midkernel Scan running as the Kimi CLI harness on OpenRouter only "
-        "(not Bedrock, not AI Gateway). OpenCode is not part of this path.\n\n"
+        "You are Midkernel Scan running through the configured AgentFlow inference harness.\n\n"
         "Workspace:\n"
         f"{clone_instructions(slug)}\n"
         f"- Shared handoff is files under the cloned repo ({repo_dir()} when local). "
@@ -764,10 +768,15 @@ def _kimi_scan_node(
     parent_id: str | None = None,
     dynamic: bool | None = None,
 ):
-    from agentflow import kimi
+    from agentflow import claude, codex, kimi
 
+    inference = configured_inference()
     slug = model or openrouter_model()
-    env = openrouter_node_env(model=slug)
+    if inference == "codex":
+        slug = env_first("MIDKERNEL_ADMIN_MODEL", default="gpt-daybreak-blue-latest")
+    elif inference == "claude":
+        slug = env_first("MIDKERNEL_ADMIN_MODEL", default="claude-opus-5")
+    env = openrouter_node_env(model=slug) if inference == "kimi" else {}
     env.update(
         kimi_io_env(
             task_id,
@@ -782,20 +791,38 @@ def _kimi_scan_node(
         "prompt": prompt,
         "model": slug,
         "tools": "read_write",
-        "provider": openrouter_provider(),
         "env": env,
         "executable": kimi_executable(),
-        "extra_args": kimi_extra_args(slug),
         "timeout_seconds": timeout_seconds if timeout_seconds is not None else hard_timeout_seconds(),
         "retries": 0,
         "target": node_target(cwd=cwd),
     }
     if success_criteria:
         kwargs["success_criteria"] = success_criteria
+    factory = kimi
+    if inference == "kimi":
+        kwargs["provider"] = openrouter_provider()
+        kwargs["extra_args"] = kimi_extra_args(slug)
+    elif inference == "codex":
+        factory = codex
+        effort = env_first("MIDKERNEL_ADMIN_EFFORT", default="ultra")
+        kwargs["repo_instructions_mode"] = "ignore"
+        kwargs["extra_args"] = [
+            "--ignore-user-config", "--ignore-rules", "--disable", "plugins",
+            "-c", f'model_reasoning_effort="{effort}"',
+        ]
+        env["MIDKERNEL_EFFECTIVE_MODEL"] = slug
+    elif inference == "claude":
+        factory = claude
+        effort = env_first("MIDKERNEL_ADMIN_EFFORT", default="max")
+        kwargs["extra_args"] = ["--effort", effort]
+        env["MIDKERNEL_EFFECTIVE_MODEL"] = slug
+    else:
+        raise ValueError(f"unsupported MIDKERNEL_ADMIN_INFERENCE={inference!r}")
     if task_id.startswith("hunter-"):
         env["MIDKERNEL_HUNTER_CONTINUE"] = "1"
         env["MIDKERNEL_NODE_TIMEOUT_SECONDS"] = str(kwargs["timeout_seconds"])
-    return kimi(**kwargs)
+    return factory(**kwargs)
 
 
 def _goal_skill(slug: str) -> str:
@@ -1175,7 +1202,7 @@ def build_goal_scan_graph(slug: str, *, description: str):
             timeout_seconds=5 * 60,
             target=node_target(cwd=cwd),
             success_criteria=[
-                {"kind": "output_contains", "value": "uploaded s3://"},
+                {"kind": "output_contains", "value": "report publication verified"},
             ],
         )
         prepare >> threat >> author >> split
@@ -1222,11 +1249,12 @@ if [ -z "$REPORT" ]; then
   exit 1
 fi
 
-python3 - "$REPORT" "$ARTIFACTS_BUCKET" "$KEY" "$AWS_REGION" <<'PY'
+python3 - "$REPORT" "$ARTIFACTS_BUCKET" "$KEY" "$AWS_REGION" "${MIDKERNEL_REPORT_TRANSPORT:-s3}" <<'PY'
 import pathlib, sys
 
 path = pathlib.Path(sys.argv[1])
 bucket, key, region = sys.argv[2], sys.argv[3], sys.argv[4]
+transport = sys.argv[5].strip().lower()
 text = path.read_text(encoding="utf-8", errors="replace")
 lower = text.lower()
 if len(text.strip()) < 80:
@@ -1242,6 +1270,15 @@ forbidden = (
 if any(token in lower for token in forbidden):
     raise SystemExit("report.md looks like a stub; refusing upload")
 
+# A devbox queue worker sends this exact validated Markdown to the app's
+# per-Run finish endpoint. The app performs its own immutable S3 write and
+# byte-for-byte readback before marking the Run complete.
+if transport == "http":
+    print(f"report publication verified: local report ready for HTTP finish ({len(text.encode('utf-8'))} bytes)")
+    raise SystemExit(0)
+if transport != "s3":
+    raise SystemExit(f"unsupported MIDKERNEL_REPORT_TRANSPORT={transport!r}")
+
 try:
     import boto3
 except ImportError as exc:
@@ -1253,6 +1290,6 @@ boto3.client("s3", region_name=region).put_object(
     Body=text.encode("utf-8"),
     ContentType="text/markdown; charset=utf-8",
 )
-print(f"uploaded s3://{bucket}/{key} ({len(text.encode('utf-8'))} bytes)")
+print(f"report publication verified: uploaded s3://{bucket}/{key} ({len(text.encode('utf-8'))} bytes)")
 PY
 """

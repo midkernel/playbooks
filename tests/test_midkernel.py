@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -13,6 +15,36 @@ def test_playbook_prompt_strips_frontmatter() -> None:
     assert "Perform a /security-review" in prompt
     assert not prompt.startswith("---")
     assert "slug:" not in prompt
+
+
+def test_official_inference_prepare_skips_openrouter(tmp_path: Path) -> None:
+    work = tmp_path / "work"
+    home = tmp_path / "home"
+    (work / "repo" / ".git").mkdir(parents=True)
+    home.mkdir()
+    env = {
+        **os.environ,
+        "RUN_ID": "run-codex-prepare",
+        "GITHUB_OWNER": "example",
+        "GITHUB_NAME": "public-repo",
+        "WORKDIR": str(work),
+        "OUTPUTS_DIR": str(tmp_path / "outputs"),
+        "HOME": str(home),
+        "MIDKERNEL_LOCAL": "1",
+        "MIDKERNEL_ADMIN_INFERENCE": "codex",
+    }
+    for name in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "KIMI_API_KEY"):
+        env.pop(name, None)
+    result = subprocess.run(
+        ["bash", "-c", mk.prepare_script("security-review")],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "inference=codex" in result.stdout
+    assert not (work / ".midkernel-openrouter").exists()
 
 
 def test_ecs_target_is_explicit_midkernel_dev() -> None:
@@ -645,3 +677,27 @@ def test_emit_goal_is_side_effect_free_without_run(
     assert not (tmp_path / ".midkernel").exists()
     payload = json.loads(capsys.readouterr().out)
     assert payload["name"] == "goal-security-review"
+
+
+def test_publish_http_transport_validates_without_s3(tmp_path: Path) -> None:
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    (outputs / "report.md").write_text(
+        "# Security review\n\n" + "Evidence-backed review result. " * 8,
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        ["bash", "-c", mk.PUBLISH_SCRIPT],
+        env={
+            **os.environ,
+            "RUN_ID": "run-http",
+            "WORKDIR": str(tmp_path / "work"),
+            "OUTPUTS_DIR": str(outputs),
+            "MIDKERNEL_REPORT_TRANSPORT": "http",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "report publication verified: local report ready for HTTP finish" in result.stdout
