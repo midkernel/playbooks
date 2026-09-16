@@ -193,7 +193,11 @@ def test_local_daybreak_nodes_use_official_codex_model_and_ultra() -> None:
     assert agents
     for node in agents:
         assert node["model"] == "gpt-daybreak-blue-latest"
-        assert node["extra_args"] == ["-c", 'model_reasoning_effort="ultra"']
+        assert node["repo_instructions_mode"] == "ignore"
+        assert node["extra_args"] == [
+            "--ignore-user-config", "--ignore-rules", "--disable", "plugins",
+            "-c", 'model_reasoning_effort="ultra"',
+        ]
         assert node["executable"].endswith("_node_io.py")
         assert "provider" not in node
         assert "OPENROUTER_API_KEY" not in node["env"]

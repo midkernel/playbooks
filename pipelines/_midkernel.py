@@ -803,7 +803,11 @@ def _kimi_scan_node(
     elif inference == "codex":
         factory = codex
         effort = env_first("MIDKERNEL_ADMIN_EFFORT", default="ultra")
-        kwargs["extra_args"] = ["-c", f'model_reasoning_effort="{effort}"']
+        kwargs["repo_instructions_mode"] = "ignore"
+        kwargs["extra_args"] = [
+            "--ignore-user-config", "--ignore-rules", "--disable", "plugins",
+            "-c", f'model_reasoning_effort="{effort}"',
+        ]
         env["MIDKERNEL_EFFECTIVE_MODEL"] = slug
     elif inference == "claude":
         factory = claude

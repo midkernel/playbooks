@@ -1691,7 +1691,7 @@ def kimi_io_env(
             "MIDKERNEL_NODE_KIND": configured_inference(),
             "MIDKERNEL_NODE_LABEL": label or node_label(nid),
             "MIDKERNEL_NODE_OUTPUTS": ",".join(outputs or []),
-            "MIDKERNEL_NODE_IO": "1",
+            "MIDKERNEL_NODE_IO": env_first("MIDKERNEL_NODE_IO") or "1",
         }
     )
     if model:

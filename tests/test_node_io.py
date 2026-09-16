@@ -611,6 +611,12 @@ def test_kimi_io_env_always_pins_real_bin(monkeypatch: pytest.MonkeyPatch) -> No
     assert env["KIMI_SHARE_DIR"].endswith(".midkernel/kimi")
 
 
+def test_kimi_io_env_preserves_explicitly_disabled_node_reporting(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MIDKERNEL_NODE_IO", "0")
+    env = io.kimi_io_env("threat-model", outputs=["THREAT_MODEL.md"])
+    assert env["MIDKERNEL_NODE_IO"] == "0"
+
+
 def test_kimi_io_env_passes_openrouter_keys(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("WORKDIR", str(tmp_path))
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
