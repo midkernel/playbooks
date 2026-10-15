@@ -37,6 +37,28 @@ The markdown **body** (after frontmatter) is the skill prompt. The graph loads i
 
 `MIDKERNEL_ADMIN_INFERENCE=codex|claude` (subscription aliases are accepted) makes prepare skip all OpenRouter secret/config work. `_node_io.py` remains the node executable and delegates AgentFlow's argv to `MIDKERNEL_CODEX_BIN` / `MIDKERNEL_CLAUDE_BIN` (default `codex` / `claude`) while retaining prompt, output, status, timeout, and dynamic-hunter artifacts. Public repositories can be cloned without `GITHUB_TOKEN`; private repositories still require a token. The private adapter must preserve the playbook `executable` when it rewrites Kimi graph nodes to Codex or Claude.
 
+The Codex overlay currently defaults to `gpt-daybreak-blue-latest` and `ultra`;
+`MIDKERNEL_ADMIN_MODEL` and `MIDKERNEL_ADMIN_EFFORT` are operator overrides. These
+graphs launch the official CLI through AgentFlow. They do not construct Responses
+API requests or select `access_programs.cyber`. A model alias or the administrative
+offering label does not establish which access program served a request. Node
+telemetry records the configured model separately from the offering; it does not
+claim to report the model behind a `-latest` alias or the server-selected program.
+
+For an API-backed adapter, follow the [Daybreak Responses API guide](https://developers.openai.com/api/docs/guides/daybreak):
+select the model independently from `access_programs.cyber`. The documented
+Daybreak pairing for `gpt-6-sol` is `daybreak_blue`. `gpt-6.1-sol` and `gpt-6-astra`
+also use `daybreak_blue`, but reduced refusals require organization Daybreak Red
+approval and the necessary project access; both reject `daybreak_red`.
+`gpt-5.6-cyber` uses `daybreak_red`. Requests must use a key from the approved
+project, and model permissions are separate. Omission lets the API choose a
+compatible program from the model and access; it does not guarantee Daybreak.
+Changing this CLI overlay requires verifying the installed Codex adapter and
+authentication path first. The API parameter is not an established Codex CLI
+configuration flag, and API project approval does not establish subscription
+availability. Keep future request selection and response program/model telemetry
+separate, and handle program incompatibility or missing access explicitly.
+
 ## How Midkernel app starts a graph
 
 1. User starts a Scan (`POST /api/scans/start` / MCP `start_run`) with `owner`, `name`, optional `playbook` (default `security-review`), `profile` (`low` \| `balanced` \| `max`), optional `threat` pin.

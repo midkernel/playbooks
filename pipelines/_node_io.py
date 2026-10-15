@@ -1214,7 +1214,9 @@ def start_node(
         startedAt=started,
         finishedAt=None,
         error=None,
-        model=model or env_first("MIDKERNEL_NODE_MODEL", "OPENROUTER_MODEL", "MODEL") or None,
+        model=model or env_first("MIDKERNEL_NODE_MODEL") or (
+            env_first("OPENROUTER_MODEL", "MODEL") if kind == "kimi" else None
+        ) or None,
         parentId=parent_id or env_first("MIDKERNEL_NODE_PARENT") or None,
         dynamic=is_dynamic_node(nid) if dynamic is None else dynamic,
     )
@@ -1936,6 +1938,9 @@ def wrap_official_agent(argv: list[str], inference: str | None = None) -> int:
     prompt = _official_prompt(argv, selected)
     if node_io_enabled():
         install_runtime()
+    admin_model = env_first("MIDKERNEL_ADMIN_MODEL")
+    if admin_model.lower() in {"daybreak", "daybreak-blue", "daybreak_blue"}:
+        admin_model = ""
     start_node(
         node_id,
         prompt=prompt,
@@ -1943,9 +1948,8 @@ def wrap_official_agent(argv: list[str], inference: str | None = None) -> int:
         label=env_first("MIDKERNEL_NODE_LABEL") or None,
         model=env_first(
             "MIDKERNEL_EFFECTIVE_MODEL",
-            "MIDKERNEL_ADMIN_MODEL",
-            "MIDKERNEL_ADMIN_OFFERING",
-        ) or None,
+            "MIDKERNEL_NODE_MODEL",
+        ) or admin_model or None,
         parent_id=env_first("MIDKERNEL_NODE_PARENT") or None,
         dynamic=env_first("MIDKERNEL_NODE_DYNAMIC") == "1" or None,
     )

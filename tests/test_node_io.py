@@ -473,8 +473,30 @@ def test_version_and_help_forward_to_real_kimi_without_node_io(
     assert "kimi-probe-ok" in captured.out
 
 
+@pytest.mark.parametrize(
+    ("model_env", "expected_model"),
+    [
+        ({}, None),
+        ({"MIDKERNEL_ADMIN_MODEL": "daybreak-blue"}, None),
+        ({"MIDKERNEL_ADMIN_MODEL": "daybreak_blue"}, None),
+        ({"MIDKERNEL_ADMIN_MODEL": "daybreak"}, None),
+        ({"MIDKERNEL_ADMIN_MODEL": "gpt-6-sol"}, "gpt-6-sol"),
+        ({"MIDKERNEL_ADMIN_MODEL": "gpt-daybreak-blue-latest"}, "gpt-daybreak-blue-latest"),
+        (
+            {"MIDKERNEL_NODE_MODEL": "gpt-6.1-sol", "MIDKERNEL_ADMIN_MODEL": "gpt-6-sol"},
+            "gpt-6.1-sol",
+        ),
+        (
+            {"MIDKERNEL_EFFECTIVE_MODEL": "gpt-6-astra", "MIDKERNEL_NODE_MODEL": "gpt-6.1-sol"},
+            "gpt-6-astra",
+        ),
+    ],
+)
 def test_official_codex_wrapper_preserves_node_telemetry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    model_env: dict[str, str],
+    expected_model: str | None,
 ) -> None:
     fake = tmp_path / "codex"
     fake.write_text("#!/bin/sh\necho codex-ran \"$@\"\n", encoding="utf-8")
@@ -488,14 +510,22 @@ def test_official_codex_wrapper_preserves_node_telemetry(
     monkeypatch.setenv("MIDKERNEL_NODE_IO", "1")
     monkeypatch.setenv("MIDKERNEL_NODE_ID", "review")
     monkeypatch.setenv("MIDKERNEL_ADMIN_OFFERING", "daybreak-blue")
+    for name in ("MIDKERNEL_EFFECTIVE_MODEL", "MIDKERNEL_NODE_MODEL", "MIDKERNEL_ADMIN_MODEL"):
+        monkeypatch.delenv(name, raising=False)
+    # Defaults for another harness must not masquerade as the Codex model.
+    monkeypatch.setenv("OPENROUTER_MODEL", "google/gemini-3.8-flash")
+    monkeypatch.setenv("MODEL", "google/gemini-3.8-flash")
+    for name, value in model_env.items():
+        monkeypatch.setenv(name, value)
     assert io.main(["exec", "--json", "review this fixture"]) == 0
     root = tmp_path / "s3" / "runs/run-wrap-codex/nodes/review"
     assert "review this fixture" in (root / "prompt.md").read_text(encoding="utf-8")
     meta = json.loads((root / "meta.json").read_text(encoding="utf-8"))
     assert meta["status"] == "completed"
-    assert meta["model"] == "daybreak-blue"
+    assert meta.get("model") == expected_model
     graph = json.loads((tmp_path / "s3" / "runs/run-wrap-codex/graph.json").read_text(encoding="utf-8"))
     assert graph["nodes"][0]["kind"] == "codex"
+    assert graph["nodes"][0].get("model") == expected_model
 
 
 def test_official_probe_uses_selected_binary_without_node_io(
