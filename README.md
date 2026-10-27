@@ -76,13 +76,11 @@ separate, and handle program incompatibility or missing access explicitly.
 
    `MIDKERNEL_AGENTFLOW_TARGET=local` keeps nodes **inside the already-launched task** (same filesystem, midkernel-dev task role, log group `/agentflow`). That avoids nested `RunTask` and stock agentflow creating IAM role `agentflow-ecs-execution` plus log group `/agentflow/<node.id>`.
 
-   **Dogfood gap (run `cmtu8jtu00003l1043oi0at41`):** app compiles a Python playbook as a stub node `id=graph` (Vercel cannot exec the Graph API) and RunTask has no command override. The image then runs `midkernel-runner` — clone target + fetch `<slug>.md` + one kimi + `report.md`. `_node_io.py` never runs, so the UI shows graph unavailable. `pipelineSha` `b5083d6b…` **is** current main: the app hashes `text.trim()`, while `sha256sum pipelines/goal-security-review.py` includes the trailing newline (`bda96226…`). Not a stale revision.
+   Ensure the task command executes the compiled graph and uses the intended playbook revision. Check uploaded run artifacts if the task falls back to a stub or the graph is unavailable.
 
-   **Confirmed CloudWatch (run `cmtuavpvs0003ib04bfyr7roc`):** playbooks #7 + runner #4 *did* start `agentflow run pipelines/goal-security-review.py` in-task. Bootstrap uploaded `graph.json` + every `prompt.md` (15 S3 objects), then agentflow `--preflight auto` failed `kimi_ready` for **every** Kimi node:
+   Inspect the uploaded run artifacts when a task starts successfully but the playbook fails.
 
-   `Node <id> (kimi) cannot find the Kimi CLI after the node shell bootstrap; '_node_io.py --version' fails in the prepared local shell.`
-
-   Playbooks set Kimi `executable` to `pipelines/_node_io.py`. Agentflow doctor execs `<executable> --version` directly (not `python3`). That failed because the helper was not `+x` (`EACCES`) and even when executable, `main()` treated `--version` as a real node (start/finish + PATH `kimi` report.md wrapper). All nodes stayed `pending`, no `output.md` / `meta.json`, exit 1. Fix: helper is `+x`; `--version` / `--help` forward to `MIDKERNEL_KIMI_BIN` or `/opt/midkernel/kimi.bin` with no I/O; real runs still upload prompt/output.
+   Playbooks set Kimi `executable` to `pipelines/_node_io.py`. Agentflow doctor execs `<executable> --version` directly (not `python3`). Ensure the configured executable is available on PATH. Helpers must forward prompts and upload output even when a node fails.
 
 4. The graph then runs inside that task. Default playbooks (`security-review`, Solana, Firedancer) are **prepare** → **review** → **publish**. `goal-security-review` is **prepare** → **threat-model** → **goal-author** → **surface-split** → **hunter-1 … hunter-N** (`GOAL_COUNT`, default 6; **siblings of `surface-split`**, `concurrency=min(GOAL_COUNT, GOAL_CONCURRENCY)` default **2**, `fail_fast=False`) → **judge-a** (`depends_on` every hunter) → **judge-b** → **assemble** → **publish**. GOAL hunters wrap to graph **COMPLETED** (exit 0 + nonempty `RESULT.md`) even on kimi timeout / non-zero; UI meta still records incomplete/failed. That is the hunter→judge barrier **and** the product settle: a hunter timeout must not mark the graph node FAILED (any FAILED node → agentflow `RunStatus.FAILED` → CLI exit 1 → runner `GraphError` → app `ecs_task_failed` + refund even if publish wrote `report.md`). Declaration order / FIFO is **not** a scheduler (pinned agentflow `09df0175` ready set is a hash-ordered `set`). Missing, empty, or stub `report.md` fails publish; the final report key is not written.
 
@@ -103,9 +101,9 @@ From `pipelines/_midkernel.py` / app `AGENTFLOW_DEV_DEFAULTS`:
 | subnets | `subnet-0f93686b81d5d8d7d`, `subnet-08ae98ea51ce9ccd7` |
 | security group | `sg-015a103caabc861d0` |
 | assign_public_ip | `true` |
-| image | `489470371031.dkr.ecr.us-east-1.amazonaws.com/midkernel-agentflow-agents:latest` |
-| execution role | `arn:aws:iam::489470371031:role/midkernel-dev-ecsTaskExecutionRole` |
-| task role | `arn:aws:iam::489470371031:role/midkernel-dev-ecsTaskRole` |
+| image | `<account>.dkr.ecr.us-east-1.amazonaws.com/midkernel-agentflow-agents:latest` |
+| execution role | `arn:aws:iam::<account>:role/midkernel-dev-ecsTaskExecutionRole` |
+| task role | `arn:aws:iam::<account>:role/midkernel-dev-ecsTaskRole` |
 | logs | `/agentflow` |
 | artifacts | `s3://midkernel-dev-artifacts/runs/<RUN_ID>/report.md` plus live `graph.json` / `nodes/<id>/` |
 
@@ -159,17 +157,13 @@ export KIMI_SHARE_DIR="$WORKDIR/.midkernel/kimi"
 In-task Kimi nodes (`executable` = `pipelines/_node_io.py`) set `BASH_ENV=/dev/null` so the runner `node-env.sh` hook does not re-clone. That skips runner `prepare_node` on review / threat-model / hunters. Playbooks therefore:
 
 1. Bake `OPENAI_BASE_URL`, `OPENROUTER_MODEL`, `KIMI_SHARE_DIR`, `HOME`, the `max_tokens` cap (runner first-wins: `MIDKERNEL_OPENROUTER_MAX_TOKENS` / `OPENROUTER_MAX_TOKENS` / `KIMI_MAX_TOKENS` / `KIMI_MODEL_MAX_TOKENS` / `KIMI_MODEL_MAX_COMPLETION_TOKENS`), and any emit-time OpenRouter keys onto **every** Kimi node env (`kimi_io_env` / `openrouter_node_env`).
-2. Pass `extra_args=["--config", "$WORKDIR/.midkernel/kimi/config.toml"]` — a **file path**. Inline TOML made kimi.bin print `LLM not set` (runs `cmtudf0470003jp040742shv6`, `cmtudm8f20003i90462yr3vxq`).
+2. Pass `extra_args=["--config", "$WORKDIR/.midkernel/kimi/config.toml"]` — a **file path**.
 3. `wrap_kimi` rewrites a non-file `--config`, writes that TOML (including `max_tokens = 16384` next to `max_output_size`, lockstep with runner), starts a localhost proxy that **never forwards** `chat/completions` without a capped `max_tokens` on the JSON body (empty / missing Content-Length / missing field → inject; non-JSON → 400), retries OpenRouter **429** (Retry-After up to 90s / exponential backoff, cap 8), and forwards the OpenRouter env to `MIDKERNEL_KIMI_BIN`.
 4. Prepare also writes `$WORKDIR/.midkernel-openrouter` + `$WORKDIR/.midkernel/kimi/config.toml` (cwd for later nodes is `$WORKDIR/repo`).
 
 ### OpenRouter `max_tokens` cap (402)
 
-**Confirmed CloudWatch (run `cmtufzqzo0003k004mt2w0m9c`):** prepare / threat-model / goal-author / surface-split succeeded. `hunter-1`…`hunter-6` all exited 1 with empty `output.md` and no `RESULT.md`. stderr showed kimi-openrouter config + `key_set=yes`. OpenRouter returned **402 `in_flight_budget_exhausted`**; `previous_errors` were also 402 saying the request reserved `max_tokens` up to **131072** but the key could only afford ~68k–120k. Judges / assemble / publish never ran; no `report.md`.
-
-**Confirmed CloudWatch (run `cmtulxq7v0003l2046bhhc3yl`):** surface-split then 402'd **`openrouter_key_limit` at `max_tokens` 32768**. The key could only afford ~13–25k. James keeps the **$10/mo** OpenRouter key limit, so the default must sit under that wallet, not under the older ~68k floor.
-
-Root cause (not a retry tweak): Midkernel config sets `max_context_size = 262144` and does not send a generation limit. kimi-cli `openai_legacy` (OpenRouter) does **not** apply `KIMI_MODEL_MAX_COMPLETION_TOKENS` or `max_output_size` — those knobs are native-Kimi / Anthropic only. OpenRouter then reserves the model catalog / remaining-context default of **131072** against in-flight budget. A 32768 reservation still exceeds a $10/mo key.
+Root cause (not a retry tweak): Midkernel config sets `max_context_size = 262144` and does not send a generation limit. kimi-cli `openai_legacy` (OpenRouter) does **not** apply `KIMI_MODEL_MAX_COMPLETION_TOKENS` or `max_output_size` — those knobs are native-Kimi / Anthropic only. OpenRouter reserves output tokens against available credit; configure a supported output-token limit that fits the key's budget.
 
 Definitive playbooks patch (lockstep with runner):
 
@@ -181,15 +175,13 @@ Definitive playbooks patch (lockstep with runner):
 
 ### OpenRouter 429 RPM (new-account limit)
 
-**Confirmed (IT) run `cmtun51000003l704q7lyyjrf`:** prepare / threat-model / goal-author / surface-split OK. `hunter-1`…`hunter-6` all failed `exit_code=75`; `output.md` 0; no `RESULT.md`. OpenRouter **429** `limit_source=openrouter_new_account` — new accounts limited to **20 requests/minute** for `moonshotai/kimi-k3`; `X-RateLimit-Remaining=0`. `max_tokens=16384` on the wire. **Not** a 402. Goals from surface-split were present.
-
-Root cause (not a `max_tokens` tweak): `emit_goal` set `concurrency=N` and `split >> hunters`, so all six hunters hit OpenRouter at once. One kimi agent loop is already several `chat/completions` calls; six in parallel exhaust the 20 RPM new-account cap immediately.
+Request concurrency can exhaust an account rate limit; changing `max_tokens` does not resolve it. Each agent can make several model calls, so set concurrency and retries to fit the account limits.
 
 Definitive playbooks patch:
 
-1. Keep GOAL hunters as **siblings of `surface-split`** (`split >> hunters`), not a `hunter-k` → `hunter-(k+1)` `depends_on` chain. Agentflow skips dependents of a FAILED node (`upstream_failure`) even when `fail_fast` is False, so a hunter-1 timeout must not be on hunter-2's `depends_on` (QA `cmtuvv61w0003gm0az74grqv2`). Run them in parallel with `concurrency=min(GOAL_COUNT, cap)`. Default cap is **2** (not 1). `#12` serialized with `concurrency=1` to dodge new-account 429; that is what made ReactFlow look serial (run `cmtvcakz70003ku0407pg6bfz`). Override from the app Start-scan UI picker via `GOAL_CONCURRENCY` (`1|2|4|6`). The gate is **exit-0 hunter wraps** plus **`judge-a depends_on` every hunter**. A hunter timeout must not mark the graph node FAILED — that would skip the judge and fail the whole GOAL run (`ecs_task_failed` + refund) even if `report.md` published.
+1. Keep GOAL hunters as **siblings of `surface-split`** (`split >> hunters`), not a `hunter-k` → `hunter-(k+1)` `depends_on` chain. Run them in parallel with `concurrency=min(GOAL_COUNT, cap)`. Default cap is **2** (not 1). Override from the app Start-scan UI picker via `GOAL_CONCURRENCY` (`1|2|4|6`). The gate is **exit-0 hunter wraps** plus **`judge-a depends_on` every hunter**. A hunter timeout must not mark the graph node FAILED — that would skip the judge and fail the whole GOAL run (`ecs_task_failed` + refund) even if `report.md` published.
 2. Do **not** lower `max_tokens` further (default remains **16384**).
-3. **429 is two layers.** Account: OpenRouter `limit_source=openrouter_new_account` is **20 requests/minute** on `moonshotai/kimi-k3` (run `cmtun51000003l704q7lyyjrf`). Playbooks / runner cannot raise that — bump the OpenRouter key tier if Midkernel can. Client: `wrap_kimi` retries **429** up to 8 times, honoring `Retry-After` through **90s** (a 20 RPM window is 60s) or exponential backoff (1s … 90s; cap 90s). 402 is not retried. Default concurrency **2** plus retries is the safe parallel; `GOAL_CONCURRENCY=6` can still 429 a new-account key.
+3. Account-level request limits require suitable retry/backoff and concurrency controls. Playbooks / runner cannot raise that — bump the OpenRouter key tier if Midkernel can. Client: `wrap_kimi` retries **429** up to 8 times, honoring `Retry-After` through **90s** (a 20 RPM window is 60s) or exponential backoff (1s … 90s; cap 90s). 402 is not retried. Default concurrency **2** plus retries is the safe parallel; `GOAL_CONCURRENCY=6` can still 429 a new-account key.
 
 Harness secrets are never in git. Image/task role may `GetSecretValue` on the two SM names above and `PutObject` on the artifacts prefix (`runs/<RUN_ID>/` including `graph.json` and `nodes/<id>/`).
 
@@ -213,7 +205,7 @@ In-task node env also sets `BASH_ENV=/dev/null` and `MIDKERNEL_NODE_READY=1` so 
 
 ### Runner / app follow-up
 
-Playbooks #7 + runner #4 already start the Python graph in-task. The next GOAL ECS failure (`cmtuavpvs0003ib04bfyr7roc`) was `_node_io.py --version` (this PR). Optional defense-in-depth on a **new** runner image (not required for this playbooks fix — node env + `--preflight never` + PATH shim target the published image):
+Playbooks #7 + runner #4 already start the Python graph in-task. Optional defense-in-depth on a **new** runner image (not required for this playbooks fix — node env + `--preflight never` + PATH shim target the published image):
 
 1. `scripts/node-env.sh`: if `MIDKERNEL_AGENTFLOW_TARGET=local` or `MIDKERNEL_NODE_IO=1`, return immediately (no clone into `/workspace`, no publish EXIT trap).
 2. `scripts/kimi-wrapper.sh`: same flags → skip `midkernel-publish-report --require`; exec `$KIMI_REAL_BIN` / `kimi.bin` only.
@@ -251,7 +243,7 @@ Graph (shared-workspace file handoff under the cloned repo):
 2. **threat-model** — write `THREAT_MODEL.md` (attacker, entry points, trust boundaries, what does **not** count). Honors `THREAT` / `THREAT_PIN`. Does not prescribe how to hunt.
 3. **goal-author** — from the threat model, write N goal prompts under `goals/` (`01-*.md` …). Each file is one precise success condition. Self-red-teams lazy outs. `GOAL_COUNT` default **6** (5 surfaces + 1 open roam).
 4. **surface-split** — read the tree + threat model; assign surfaces / open roam into those goal files. Persistence: “no bugs found yet” is not done.
-5. **hunter-1** … **hunter-N** — first-class dynamic nodes from `GOAL_COUNT` (default 6). **Siblings of `surface-split`** (agentflow `depends_on`); **parallel via `concurrency=min(GOAL_COUNT, GOAL_CONCURRENCY)`** (default cap **2**; app picker `1\|2\|4\|6`). Graph `fail_fast=False` so one unexpected hunter FAIL does not skip hunters N+1… (QA `cmtuvv61w0003gm0az74grqv2`: hunter-1 `Timed out after 1800s`, empty RESULT.md, fail_fast killed the GOAL run). Wrap (`MIDKERNEL_HUNTER_CONTINUE=1`) kills kimi at the soft deadline (90% of hard), writes incomplete `RESULT.md` if needed, and **exits 0** so the graph node is COMPLETED. OpenRouter 429 new-account RPM (`cmtun51000003l704q7lyyjrf`) is an **account** limit; client mitigation is `wrap_kimi` Retry-After plus the default cap of 2 — not a hunter `depends_on` chain. Each picks `goals/0N-*.md` if present and no-ops cleanly if missing. Soft deadline is 90% of the hard node timeout (low: **27 minutes** / 1620s). Candidates go under `findings/hunter-N/`. **No** known-issues / GitHub issue-or-PR duplicate search. Live `graph.json` draws the same fan-out `surface-split → hunter-1…N` plus each hunter → `judge-a`.
+5. **hunter-1** … **hunter-N** — first-class dynamic nodes from `GOAL_COUNT` (default 6). **Siblings of `surface-split`** (agentflow `depends_on`); **parallel via `concurrency=min(GOAL_COUNT, GOAL_CONCURRENCY)`** (default cap **2**; app picker `1\|2\|4\|6`). Graph `fail_fast=False` so one unexpected hunter FAIL does not skip hunters N+1…. Wrap (`MIDKERNEL_HUNTER_CONTINUE=1`) kills kimi at the soft deadline (90% of hard), writes incomplete `RESULT.md` if needed, and **exits 0** so the graph node is COMPLETED. Account-level request limits require suitable retry/backoff and concurrency controls. Each picks `goals/0N-*.md` if present and no-ops cleanly if missing. Soft deadline is 90% of the hard node timeout (low: **27 minutes** / 1620s). Candidates go under `findings/hunter-N/`. **No** known-issues / GitHub issue-or-PR duplicate search. Live `graph.json` draws the same fan-out `surface-split → hunter-1…N` plus each hunter → `judge-a`.
 6. **judge-a** — security-relevance vs `THREAT_MODEL.md` (default `OPENROUTER_MODEL` / balanced Pareto Scan preset `google/gemini-3.8-flash`). Survivors → `findings/validated-a/`. **`depends_on` every hunter** — not ready until every hunter is COMPLETED. Declaration order is not a scheduler.
 7. **judge-b** — PoC / exploitability on a **different** OpenRouter model (default `anthropic/claude-sonnet-4.5`). Survivors → `findings/validated-b/`.
 8. **assemble** — only dual-pass survivors → `report.md`. Empty findings with evidence of what was tried is allowed. Never invent. No stub language.
