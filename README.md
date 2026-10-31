@@ -1,6 +1,6 @@
 # midkernel/playbooks
 
-MIT-licensed public playbooks: Midkernel default runs and third-party agent units users can customize.
+Open, MIT-licensed security-review workflows that [Midkernel Scan](https://www.midkernel.com/security/scan) runs on a GitHub repository. Read one before you run it, or fork it. More at [midkernel.com/security/open-source](https://www.midkernel.com/security/open-source).
 
 Execution is native [agentenv/agentflow](https://github.com/agentenv/agentflow) (Python Graph API). Public runs default to the Kimi CLI through OpenRouter. The same graphs support official Codex or Claude adapters when the private runner selects `MIDKERNEL_ADMIN_INFERENCE`; workspace preparation and Run UI telemetry are provider-independent.
 
