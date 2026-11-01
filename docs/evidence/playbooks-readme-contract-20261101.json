@@ -1,0 +1,26 @@
+{
+  "date": "2026-11-01",
+  "request": "https://github.com/midkernel/mail/issues/13#issuecomment-6555969467",
+  "base": "a70f9060164979dda846b9f68d386af28ede435c",
+  "scope": "Remove ten expectations for operator QA records and removed historical prose; preserve public configuration and default-target documentation checks. README and runtime unchanged.",
+  "baseline": "Original README test reproduces AssertionError against the cleaned README.",
+  "python": "3.14.7",
+  "tests": {
+    "command": ".venv/bin/python -m pytest -q",
+    "passed": 123
+  },
+  "graph_validation": {
+    "command": ".venv/bin/agentflow validate pipelines/<slug>.py",
+    "passed": [
+      "security-review",
+      "solana-validator-security",
+      "firedancer-fuzz-triage",
+      "goal-security-review"
+    ]
+  },
+  "diff_check": "passed",
+  "test_sha256": "6720237a837f2e63afba59dd8ed8456a12349e2a8ded0c1fca05c01e4cb35631",
+  "original_assertions": 79,
+  "retained_assertions": 69,
+  "limits": "Local validation only; hosted CI uses Python 3.13 and is reported separately. No scans, model calls, deployment or production requests."
+}
