@@ -251,6 +251,18 @@ Graph (shared-workspace file handoff under the cloned repo):
 
 Out of scope: known-issues / issue-tracker dedupe, CVE / P-critical variant orchestration, aicov-style coverage tooling.
 
+## Contributor setup and pre-push checks
+
+Run `python3 scripts/setup-dev.py` from this checkout (Python >=3.11, Git >=2.31,
+POSIX shell). Setup prepares `.venv`, installs the existing `.[dev]` dependencies
+and actually enrolls this worktree's pre-push hook. Normal CI/package installation
+does not install hooks. [Hook coverage, prerequisites and limits](docs/prepush.md)
+explain supported pushes and custom-hook preservation.
+
+The hook runs the existing registry contract tests before a clean HEAD branch
+push. It does not execute a graph, contact a provider, install packages or claim
+Python formatting/lint/type coverage. Full CI remains authoritative.
+
 ## Validate locally
 
 ```bash

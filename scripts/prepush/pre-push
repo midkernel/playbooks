@@ -1,0 +1,24 @@
+#!/bin/sh
+# Midkernel pre-push dispatcher v1. Shared file; enrollment is worktree-private.
+set -eu
+# Sentinel preserves paths ending in a newline; remove it and Git's one LF.
+git_dir=$(git rev-parse --absolute-git-dir && printf .) || exit 1
+git_dir=${git_dir%?}; git_dir=${git_dir%?}
+marker=$git_dir/midkernel-prepush-v1
+if [ ! -e "$marker" ] && [ ! -L "$marker" ]; then exit 0; fi
+if [ ! -f "$marker" ] || [ -L "$marker" ]; then
+    echo 'pre-push: invalid enrollment marker; rerun contributor setup.' >&2
+    exit 1
+fi
+root=$(git rev-parse --show-toplevel && printf .) || exit 1
+root=${root%?}; root=${root%?}
+cd "$root"
+command -v python3 >/dev/null 2>&1 || {
+    echo 'pre-push: Python 3 is required; install contributor prerequisites.' >&2
+    exit 127
+}
+[ -f scripts/prepush/check.py ] && [ ! -L scripts/prepush/check.py ] || {
+    echo 'pre-push: this branch lacks scripts/prepush/check.py; restore hook support.' >&2
+    exit 1
+}
+exec python3 -I scripts/prepush/check.py "$@"

@@ -36,3 +36,27 @@ Superseded runs of the same PR are cancelled. Each main push uses its own
 concurrency group and keeps full validation. Actionlint 1.7.7 and whitespace
 checks pass. Hosted cold/warm results and before/after timings are pending.
 No unit-test execution is claimed from these workflow-only static checks.
+
+## Contributor quick gate
+
+Explicit `python3 scripts/setup-dev.py` installs existing dev dependencies into
+`.venv` and enrolls the reviewed per-worktree hook. The quick adapter runs the
+existing three registry-contract tests; no graph execution, formatter/linter/type
+coverage or full-suite coverage is claimed. Full CI is unchanged. Actual local adoption results are recorded below; hosted after measurements
+for this addition remain pending.
+
+On 2026-11-01, `python3 scripts/setup-dev.py` completed in the actual linked
+worktree, installed the dispatcher and its private enrollment marker, and left
+Git configuration unchanged (Python 3.12.3). All 29 portable hook tests passed.
+In an isolated repository with a local bare remote, a clean push passed the
+three registry tests. A committed invalid listing slug failed one of them and
+blocked the push without changing the remote ref; a corrected tip passed.
+Missing `.venv` failed with the setup diagnostic, and the actual dirty parent
+checkout was rejected. Fixture pushes used company author/committer metadata.
+No live graph, provider, database, image or browser was invoked.
+
+The temporary fixture reused the already prepared venv through an explicitly
+ignored symlink. An initial missing-dependency control had accidentally tracked
+that symlink and hit the dirty-tree guard instead; correcting the fixture ignore
+made the intended missing-venv assertion pass. This did not require a product
+code change. These are local adoption results, not hosted performance savings.
