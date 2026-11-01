@@ -47,7 +47,8 @@ def test_pipeline_files_exist() -> None:
         assert path.is_file(), f"missing graph {path}"
 
 
-def test_readme_documents_openrouter_lock_and_default_targets() -> None:
+def test_readme_documents_public_configuration_and_default_targets() -> None:
+    # Keep public configuration coverage without requiring removed operator QA records.
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "OpenRouter" in readme
     assert "Kimi" in readme
@@ -77,22 +78,13 @@ def test_readme_documents_openrouter_lock_and_default_targets() -> None:
     assert "KIMI_MODEL_MAX_TOKENS" in readme
     assert "first-wins" in readme.lower() or "First-wins" in readme
     assert "16384" in readme
-    assert "32768" in readme
     assert "65536" in readme
     assert "valid opt-in" in readme
     assert "set the env explicitly to opt in" not in readme
     assert "131072 only if set explicitly" not in readme
-    assert "cmtufzqzo0003k004mt2w0m9c" in readme
-    assert "cmtulxq7v0003l2046bhhc3yl" in readme
-    assert "openrouter_key_limit" in readme
-    assert "in_flight_budget_exhausted" in readme
     assert "scripts/ecs-in-task.sh" in readme
     assert "--version" in readme
-    assert "cmtuavpvs0003ib04bfyr7roc" in readme
     assert "sha256(text.trim())" in readme or "text.trim()" in readme
-    assert "cmtun51000003l704q7lyyjrf" in readme
-    assert "openrouter_new_account" in readme
-    assert "20 requests/minute" in readme
     assert "429" in readme
     assert "fan-out" in readme.lower() or "parallel" in readme.lower()
     assert "depends_on" in readme
@@ -100,7 +92,6 @@ def test_readme_documents_openrouter_lock_and_default_targets() -> None:
     assert "GOAL_CONCURRENCY" in readme
     assert "default **2**" in readme
     assert "`1|2|4|6`" in readme
-    assert "cmtuvv61w0003gm0az74grqv2" in readme
     assert "AGENT_TIMEOUT_SECONDS" in readme
     assert "1620" in readme
     assert "27 minutes" in readme
